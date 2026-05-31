@@ -15,6 +15,7 @@ rm -rf "$dst"
 mkdir -p "$dst"
 
 rsync -a --delete --prune-empty-dirs \
+	--include='/index.html' \
 	--include='/js/***' \
 	--include='/connect/***' \
 	--include='/images/***' \

@@ -4,16 +4,16 @@ A Copilot CLI canvas extension that embeds [diagrams.net](https://www.diagrams.n
 
 ## Files
 
-- `index.js` — extension entry; declares the `drawio` canvas via `@github/copilot-sdk/extension` and serves the iframe bridge from a loopback HTTP server.
-- `extension.mjs` — Copilot CLI user/project extension entrypoint. Keep this in sync with `index.js` when packaging.
-- `package.json` — Node ESM package with the `@github/copilot-sdk` dependency.
-- `copilot-extension.json` — extension manifest (`entry: node index.js`).
+- `extension.mjs` — Copilot CLI extension entrypoint; declares the `drawio` canvas via `@github/copilot-sdk/extension` and serves the iframe bridge from a loopback HTTP server.
+- `index.js` — legacy standalone entry kept in sync with `extension.mjs` for older local testing flows.
+- `package.json` — optional Node ESM metadata for local standalone testing. The Copilot runtime supplies `@github/copilot-sdk`; do not vendor or pin it here.
+- `copilot-extension.json` — extension manifest (`entry: node extension.mjs`).
 - `drawio-webapp/` — generated offline diagrams.net assets, copied from the root `drawio` git submodule by `scripts/sync-drawio-webapp.sh`.
 
 ## How it works
 
-1. `open` lazily starts a single shared loopback HTTP server on `127.0.0.1:<port>` and returns `http://127.0.0.1:<port>/?instanceId=<id>` as the iframe URL. Only loopback URLs are allowed.
-2. The served HTML embeds `https://embed.diagrams.net/` with `proto=json` and dark UI. Messages from the editor (autosave, save, export) are forwarded to backend endpoints.
+1. `open` lazily starts a single shared loopback HTTP server on `127.0.0.1:<port>` and returns `http://127.0.0.1:<port>/?instanceId=<id>` as the iframe URL. Only loopback URLs are allowed. Opens are idempotent: when the runtime restores a live open-canvas snapshot after an extension reload, the same input rehydrates the canvas from its artifact, file path, or supplied XML.
+2. The served HTML loads the bundled offline diagrams.net webapp with `proto=json` and dark UI. Messages from the editor (autosave, save, export) are forwarded to backend endpoints.
 3. Agent-driven commands (`get_editor_state`, `set_diagram`, `export_diagram`) are pushed to the iframe over Server-Sent Events on `/events`. Replies come back through `/iframe-reply` and resolve a per-request promise.
 
 The current extension uses the offline bundled draw.io webapp directly and injects artifact commands into draw.io's native **File** menu:
@@ -65,16 +65,15 @@ git submodule update --init --recursive
 
 Place `.github/extensions/drawio/` at project scope or copy it to `~/.copilot/extensions/drawio/` for user scope.
 
-For local standalone testing, install dependencies:
+For local standalone testing, run the extension through the Copilot CLI extension loader so the SDK import is resolved by the runtime:
 
 ```sh
-cd .github/extensions/drawio
-npm install
+copilot
 ```
 
-The Copilot runtime starts `extension.mjs` and routes canvas callbacks to this process.
+The Copilot runtime starts `extension.mjs`, tracks live open canvas snapshots, and routes canvas callbacks to this process.
 
 ## Notes
 
-- Internet access is required for the inner iframe to load `embed.diagrams.net`. The local `standalone.mjs` prototype demonstrates an offline bundled draw.io webapp.
-- Diagram XML is held in-memory per `instanceId` unless `path` is provided, in which case the diagram is file-backed.
+- The current runtime snapshot stores open canvas metadata and input. Bind long-lived diagrams with `artifactName` or `path` so a restored canvas can rehydrate from durable XML after extension or app restarts.
+- Diagram XML is held in-memory per `instanceId` unless `artifactName` or `path` is provided, in which case the diagram is file-backed.

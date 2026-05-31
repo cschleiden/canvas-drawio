@@ -3,11 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "main": "index.js",
+  "main": "extension.mjs",
   "scripts": {
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "@github/copilot-sdk": "1.0.0-beta.7"
+    "start": "node extension.mjs"
   }
 }
