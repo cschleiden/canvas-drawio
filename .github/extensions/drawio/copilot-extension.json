@@ -2,5 +2,6 @@
   "name": "drawio",
   "displayName": "draw.io",
   "description": "Embed diagrams.net (draw.io) as a canvas with read/write/export actions.",
-  "entry": "node index.js"
+  "entry": "node extension.mjs",
+  "version": 1
 }
