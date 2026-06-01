@@ -8,7 +8,7 @@ A Copilot CLI canvas extension that embeds [diagrams.net](https://www.diagrams.n
 - `index.js` — legacy standalone entry kept in sync with `extension.mjs` for older local testing flows.
 - `package.json` — optional Node ESM metadata for local standalone testing. The Copilot runtime supplies `@github/copilot-sdk`; do not vendor or pin it here.
 - `copilot-extension.json` — extension manifest (`entry: node extension.mjs`).
-- `drawio-webapp/` — generated offline diagrams.net assets, copied from the root `drawio` git submodule by `scripts/sync-drawio-webapp.sh`.
+- `drawio-webapp/` — vendored offline diagrams.net assets, copied from the root `drawio` git submodule by `scripts/sync-drawio-webapp.sh`.
 
 ## How it works
 
@@ -56,7 +56,9 @@ The intended editing loop is:
 
 ## Install
 
-Initialize the draw.io submodule and generate the offline webapp assets:
+The extension includes the generated offline webapp assets in `drawio-webapp/`, so a normal clone has everything needed to load the canvas.
+
+To refresh the vendored assets from the pinned draw.io submodule:
 
 ```sh
 git submodule update --init --recursive
