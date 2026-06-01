@@ -9,6 +9,7 @@ import { CanvasError, createCanvas, joinSession } from "@github/copilot-sdk/exte
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WEBAPP_DIR = path.join(__dirname, "drawio-webapp");
 let artifactsDir;
+let session;
 
 const BLANK_XML = `<mxfile><diagram id="blank" name="Page-1"><mxGraphModel dx="800" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0"><root><mxCell id="0"/><mxCell id="1" parent="0"/></root></mxGraphModel></diagram></mxfile>`;
 
@@ -49,6 +50,8 @@ function getInstance(instanceId) {
 			filePath: null,
 			artifactName: null,
 			autosave: true,
+			extensionId: null,
+			canvasId: "drawio",
 			editorState: defaultEditorState(),
 			sseClients: new Set(),
 			pending: new Map(),
@@ -182,6 +185,29 @@ async function bindDiagramFile(inst, filePath, { moveExisting = false } = {}) {
 	return { path: inst.filePath, title: inst.title };
 }
 
+function currentOpenInput(inst) {
+	const input = { title: inst.title, xml: inst.xml, autosave: inst.autosave };
+	if (inst.artifactName) return { artifactName: inst.artifactName, ...input };
+	if (inst.filePath) return { path: inst.filePath, ...input };
+	return { title: inst.title };
+}
+async function refreshCanvasChrome(inst) {
+	const request = {
+		canvasId: inst.canvasId || "drawio",
+		instanceId: inst.instanceId,
+		input: currentOpenInput(inst),
+	};
+	if (inst.extensionId) request.extensionId = inst.extensionId;
+	await session.rpc.canvas.open(request);
+}
+
+function queueCanvasChromeRefresh(inst) {
+	setTimeout(() => {
+		refreshCanvasChrome(inst).catch((error) => {
+			session.log(`Failed to refresh draw.io canvas title: ${error?.message || error}`, { level: "warning", ephemeral: true });
+		});
+	}, 0);
+}
 function renderIndexHtml(instanceId) {
 	return `<!doctype html>
 <html>
@@ -246,6 +272,10 @@ function renderIndexHtml(instanceId) {
 	let editorUi;
 	let lastDirty = false;
 	let currentArtifactName = "";
+	let currentFilePath = "";
+	let currentSavedTitle = "";
+	let hasBackingFile = false;
+	let currentAutosave = true;
 
 	function sendBackend(path, body) {
 		return fetch(path, {
@@ -304,6 +334,40 @@ function renderIndexHtml(instanceId) {
 			} : null,
 		};
 	}
+	function syncFileState(state) {
+		currentArtifactName = state.artifactName || "";
+		currentFilePath = state.filePath || "";
+		currentSavedTitle = state.title || currentArtifactName || currentFilePath.split(/[\\\\/]/).pop() || "";
+		hasBackingFile = Boolean(currentArtifactName || currentFilePath);
+		if ("autosave" in state) currentAutosave = state.autosave !== false;
+		document.title = hasBackingFile ? currentSavedTitle : "Untitled diagram (unsaved)";
+	}
+	function markEditorSaved(title) {
+		currentSavedTitle = title || currentSavedTitle || currentArtifactName || "draw.io";
+		document.title = currentSavedTitle;
+		lastDirty = false;
+		editorUi?.editor?.setFilename?.(currentSavedTitle);
+		editorUi?.editor?.setModified?.(false);
+		const file = editorUi?.getCurrentFile?.();
+		if (file) {
+			if (currentSavedTitle && typeof file.rename === "function" && file.getTitle?.() !== currentSavedTitle) {
+				try {
+					file.rename(currentSavedTitle, () => {}, () => {});
+				} catch {
+					if ("title" in file) file.title = currentSavedTitle;
+					file.descriptorChanged?.();
+				}
+			} else if (currentSavedTitle && "title" in file && file.title !== currentSavedTitle) {
+				file.title = currentSavedTitle;
+				file.descriptorChanged?.();
+			}
+			file.setShadowModified?.(false);
+			file.setModified?.(false);
+		}
+		editorUi?.updateDocumentTitle?.();
+		document.title = currentSavedTitle;
+		editorUi?.editor?.setStatus?.("Autosaving to " + currentSavedTitle);
+	}
 
 	async function exportXmlFromEditor() {
 		return await new Promise((resolve, reject) => {
@@ -328,9 +392,8 @@ function renderIndexHtml(instanceId) {
 		const xml = await exportXmlFromEditor();
 		const result = await (await sendBackend("/artifact", { instanceId, artifactName, xml, moveExisting })).json();
 		if (!result.ok) throw new Error(result.error || "Save failed");
-		currentArtifactName = result.artifactName;
-		document.title = result.title || "draw.io";
-		lastDirty = false;
+		syncFileState({ artifactName: result.artifactName, filePath: result.path, title: result.title });
+		markEditorSaved(result.title);
 		return result;
 	}
 
@@ -548,12 +611,15 @@ function renderIndexHtml(instanceId) {
 			}), "*");
 		} else if (msg.event === "init") {
 			const r = await fetch("/state?instanceId=" + encodeURIComponent(instanceId));
-			const { xml, artifactName, title } = await r.json();
-			currentArtifactName = artifactName || "";
-			document.title = currentArtifactName ? title : "Untitled diagram (unsaved)";
+			const state = await r.json();
+			const { xml } = state;
+			syncFileState(state);
 			window.postMessage(JSON.stringify({ action: "load", xml, autosave: 1 }), "*");
+			if (hasBackingFile) {
+				setTimeout(() => markEditorSaved(currentSavedTitle), 0);
+			}
 		} else if (msg.event === "autosave" || msg.event === "save") {
-			lastDirty = msg.event === "autosave";
+			lastDirty = !(hasBackingFile && currentAutosave);
 			await sendBackend("/state", { instanceId, xml: msg.xml, editorState: buildEditorState(msg) });
 		} else if (msg.event === "export") {
 			await sendBackend("/iframe-reply", {
@@ -588,8 +654,8 @@ function renderIndexHtml(instanceId) {
 		window.editorUi = this;
 		const result = old.apply(this, args);
 		installArtifactFileMenu(this);
-		if (currentArtifactName) {
-			this.editor?.setStatus?.("Autosaving to " + currentArtifactName);
+		if (hasBackingFile) {
+			setTimeout(() => markEditorSaved(currentSavedTitle), 0);
 		} else {
 			this.editor?.setStatus?.("Unsaved diagram");
 		}
@@ -609,7 +675,13 @@ function renderIndexHtml(instanceId) {
 	sse.onmessage = async (e) => {
 		const cmd = JSON.parse(e.data);
 		if (cmd.type === "load") {
+			syncFileState(cmd);
 			window.postMessage(JSON.stringify({ action: "load", xml: cmd.xml, autosave: 1 }), "*");
+			if (cmd.saved === false) {
+				lastDirty = true;
+			} else if (hasBackingFile) {
+				setTimeout(() => markEditorSaved(currentSavedTitle), 0);
+			}
 		} else if (cmd.type === "export") {
 			window.postMessage(JSON.stringify({ action: "export", format: cmd.format, message: { requestId: cmd.requestId } }), "*");
 		} else if (cmd.type === "editor_state") {
@@ -677,7 +749,7 @@ async function ensureServer() {
 			if (req.method === "GET" && url.pathname === "/state") {
 				const inst = getInstance(instanceId);
 				res.writeHead(200, { "content-type": "application/json" });
-				res.end(JSON.stringify({ xml: inst.xml, title: inst.title, filePath: inst.filePath, artifactName: inst.artifactName }));
+				res.end(JSON.stringify({ xml: inst.xml, title: inst.title, filePath: inst.filePath, artifactName: inst.artifactName, autosave: inst.autosave }));
 				return;
 			}
 
@@ -699,6 +771,7 @@ async function ensureServer() {
 				const inst = getInstance(body.instanceId);
 				if (typeof body.xml === "string") inst.xml = body.xml;
 				const result = await bindArtifactFile(inst, body.artifactName, { moveExisting: body.moveExisting === true });
+				queueCanvasChromeRefresh(inst);
 				res.writeHead(200, { "content-type": "application/json" });
 				res.end(JSON.stringify({ ok: true, ...result }));
 				return;
@@ -709,6 +782,7 @@ async function ensureServer() {
 				const inst = getInstance(body.instanceId);
 				if (typeof body.xml === "string") inst.xml = body.xml;
 				const result = await bindDiagramFile(inst, body.path, { moveExisting: body.moveExisting === true });
+				queueCanvasChromeRefresh(inst);
 				res.writeHead(200, { "content-type": "application/json" });
 				res.end(JSON.stringify({ ok: true, ...result }));
 				return;
@@ -815,17 +889,20 @@ const canvas = createCanvas({
 				const inst = getInstance(instanceId);
 				if (typeof input.path === "string") {
 					inst.filePath = resolveDiagramPath(input.path);
+					inst.artifactName = null;
 					inst.title = input.title ?? path.basename(inst.filePath);
 				}
 				if (typeof input.autosave === "boolean") inst.autosave = input.autosave;
 				inst.xml = input.xml;
 				if (typeof input.title === "string") inst.title = input.title;
 				await writeDiagramFile(inst, input.xml);
+				const saved = Boolean(inst.filePath && inst.autosave !== false);
 				inst.editorState = {
 					...inst.editorState,
-					diagram: { ...inst.editorState.diagram, title: inst.title, dirty: false },
+					diagram: { ...inst.editorState.diagram, title: inst.title, dirty: !saved },
 				};
-				pushToEditor(inst, { type: "load", xml: input.xml });
+				pushToEditor(inst, { type: "load", xml: input.xml, title: inst.title, filePath: inst.filePath, artifactName: inst.artifactName, autosave: inst.autosave, saved });
+				queueCanvasChromeRefresh(inst);
 				return { ok: true };
 			},
 		},
@@ -865,9 +942,11 @@ const canvas = createCanvas({
 			},
 		},
 	],
-	async open({ instanceId, input }) {
+	async open({ extensionId, canvasId, instanceId, input }) {
 		const url = await ensureServer();
 		const inst = getInstance(instanceId);
+		inst.extensionId = extensionId;
+		inst.canvasId = canvasId;
 		if (input && typeof input.artifactName === "string") {
 			const { artifactName, filePath } = resolveArtifactPath(input.artifactName);
 			inst.artifactName = artifactName;
@@ -913,7 +992,7 @@ const canvas = createCanvas({
 	},
 });
 
-const session = await joinSession({ canvases: [canvas] });
+session = await joinSession({ canvases: [canvas] });
 artifactsDir = session.workspacePath ? path.join(session.workspacePath, "files") : undefined;
 if (artifactsDir) {
 	await mkdir(artifactsDir, { recursive: true });
