@@ -1,19 +1,36 @@
 import http from "node:http";
-import { randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { createReadStream, createWriteStream } from "node:fs";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
+import { createGunzip } from "node:zlib";
 import { CanvasError, createCanvas, joinSession } from "@github/copilot-sdk/extension";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const WEBAPP_DIR = path.join(__dirname, "drawio-webapp");
+const BUNDLED_WEBAPP_DIR = path.join(__dirname, "drawio-webapp");
+const ASSET_MANIFEST = JSON.parse(await readFile(path.join(__dirname, "assets-manifest.json"), "utf8"));
+const COPILOT_HOME = process.env.COPILOT_HOME || path.join(homedir(), ".copilot");
+const ASSET_CACHE_ROOT = path.join(COPILOT_HOME, "extensions", "drawio", "artifacts", "drawio-webapp");
+const ASSET_CACHE_DIR = path.join(ASSET_CACHE_ROOT, ASSET_MANIFEST.version);
+const ASSET_COMPLETE_FILE = path.join(ASSET_CACHE_DIR, ".complete.json");
 let artifactsDir;
 let session;
 
 const BLANK_XML = `<mxfile><diagram id="blank" name="Page-1"><mxGraphModel dx="800" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0"><root><mxCell id="0"/><mxCell id="1" parent="0"/></root></mxGraphModel></diagram></mxfile>`;
 
 const instances = new Map();
+const assetSseClients = new Set();
+const assetState = {
+	status: "idle",
+	message: "draw.io assets are not installed yet.",
+	error: null,
+	webappDir: null,
+	promise: null,
+};
 
 const mimeTypes = new Map([
 	[".html", "text/html; charset=utf-8"],
@@ -31,6 +48,217 @@ const mimeTypes = new Map([
 	[".woff2", "font/woff2"],
 	[".ttf", "font/ttf"],
 ]);
+
+function assetPayload() {
+	return {
+		status: assetState.status,
+		message: assetState.message,
+		error: assetState.error,
+		version: ASSET_MANIFEST.version,
+		downloadUrl: process.env.DRAWIO_ASSET_URL || ASSET_MANIFEST.downloadUrl,
+	};
+}
+
+function notifyAssetClients() {
+	const payload = `data: ${JSON.stringify(assetPayload())}\n\n`;
+	for (const res of assetSseClients) {
+		try {
+			res.write(payload);
+		} catch {}
+	}
+}
+
+function updateAssetState(status, message, error = null) {
+	assetState.status = status;
+	assetState.message = message;
+	assetState.error = error;
+	notifyAssetClients();
+}
+
+async function directoryHasWebapp(dir) {
+	try {
+		const [index, app, styles] = await Promise.all([
+			stat(path.join(dir, "index.html")),
+			stat(path.join(dir, "js", "app.min.js")),
+			stat(path.join(dir, "styles", "grapheditor.css")),
+		]);
+		return index.isFile() && app.isFile() && styles.isFile();
+	} catch {
+		return false;
+	}
+}
+
+async function cacheIsComplete() {
+	if (!await directoryHasWebapp(ASSET_CACHE_DIR)) return false;
+	try {
+		const complete = JSON.parse(await readFile(ASSET_COMPLETE_FILE, "utf8"));
+		return complete.version === ASSET_MANIFEST.version && complete.sha256 === ASSET_MANIFEST.sha256;
+	} catch {
+		return false;
+	}
+}
+
+async function getReadyWebappDir() {
+	if (assetState.webappDir && await directoryHasWebapp(assetState.webappDir)) {
+		return assetState.webappDir;
+	}
+	if (await cacheIsComplete()) {
+		assetState.webappDir = ASSET_CACHE_DIR;
+		updateAssetState("ready", "draw.io assets are installed.");
+		return assetState.webappDir;
+	}
+	if (await directoryHasWebapp(BUNDLED_WEBAPP_DIR)) {
+		assetState.webappDir = BUNDLED_WEBAPP_DIR;
+		updateAssetState("ready", "Using bundled draw.io assets.");
+		return assetState.webappDir;
+	}
+	return null;
+}
+
+function hashStream() {
+	const hash = createHash("sha256");
+	const stream = new Transform({
+		transform(chunk, encoding, callback) {
+			hash.update(chunk);
+			callback(null, chunk);
+		},
+	});
+	return { stream, digest: () => hash.digest("hex") };
+}
+
+async function downloadAssetArchive(targetPath) {
+	const url = process.env.DRAWIO_ASSET_URL || ASSET_MANIFEST.downloadUrl;
+	const { stream, digest } = hashStream();
+	if (url.startsWith("file://")) {
+		await pipeline(createReadStream(fileURLToPath(url)), stream, createWriteStream(targetPath));
+	} else {
+		const response = await fetch(url);
+		if (!response.ok || !response.body) {
+			throw new Error(`Failed to download draw.io assets from ${url}: HTTP ${response.status}`);
+		}
+		await pipeline(Readable.fromWeb(response.body), stream, createWriteStream(targetPath));
+	}
+	const actualSha256 = digest();
+	if (actualSha256 !== ASSET_MANIFEST.sha256) {
+		throw new Error(`Downloaded draw.io assets checksum mismatch. Expected ${ASSET_MANIFEST.sha256}, got ${actualSha256}.`);
+	}
+}
+
+function tarString(buffer, start, length) {
+	return buffer.subarray(start, start + length).toString("utf8").replace(/\0.*$/s, "");
+}
+
+function stripArchiveRoot(name) {
+	const archiveRoot = ASSET_MANIFEST.archiveRoot || "";
+	const normalized = name.replace(/\\/g, "/").replace(/^\.\/+/, "");
+	if (!archiveRoot) return normalized;
+	if (normalized === archiveRoot) return "";
+	if (normalized.startsWith(`${archiveRoot}/`)) return normalized.slice(archiveRoot.length + 1);
+	return normalized;
+}
+
+function parsePaxHeaders(buffer) {
+	const headers = {};
+	let text = buffer.toString("utf8");
+	while (text.length > 0) {
+		const space = text.indexOf(" ");
+		if (space <= 0) break;
+		const length = Number.parseInt(text.slice(0, space), 10);
+		if (!Number.isFinite(length) || length <= space + 1 || length > text.length) break;
+		const record = text.slice(space + 1, length - 1);
+		const equals = record.indexOf("=");
+		if (equals > 0) headers[record.slice(0, equals)] = record.slice(equals + 1);
+		text = text.slice(length);
+	}
+	return headers;
+}
+
+async function extractTarGz(archivePath, outputDir) {
+	const chunks = [];
+	await pipeline(
+		createReadStream(archivePath),
+		createGunzip(),
+		new Transform({
+			transform(chunk, encoding, callback) {
+				chunks.push(chunk);
+				callback();
+			},
+		}),
+	);
+	const tar = Buffer.concat(chunks);
+	let paxHeaders = {};
+	for (let offset = 0; offset + 512 <= tar.length;) {
+		let name = tarString(tar, offset, 100);
+		if (!name) break;
+		const sizeText = tarString(tar, offset + 124, 12).trim();
+		const size = Number.parseInt(sizeText || "0", 8);
+		const type = tarString(tar, offset + 156, 1) || "0";
+		const contentOffset = offset + 512;
+		const content = tar.subarray(contentOffset, contentOffset + size);
+		if (type === "x") {
+			paxHeaders = parsePaxHeaders(content);
+			offset = contentOffset + Math.ceil(size / 512) * 512;
+			continue;
+		}
+		if (paxHeaders.path) name = paxHeaders.path;
+		paxHeaders = {};
+		const relative = stripArchiveRoot(name);
+		if (relative && !relative.startsWith("../") && !path.isAbsolute(relative)) {
+			const outputPath = path.resolve(outputDir, relative);
+			const relativeOutput = path.relative(outputDir, outputPath);
+			if (!relativeOutput.startsWith("..") && !path.isAbsolute(relativeOutput)) {
+				if (type === "5") {
+					await mkdir(outputPath, { recursive: true });
+				} else if (type === "0" || type === "") {
+					await mkdir(path.dirname(outputPath), { recursive: true });
+					await writeFile(outputPath, content);
+				}
+			}
+		}
+		offset = contentOffset + Math.ceil(size / 512) * 512;
+	}
+}
+
+async function installAssets() {
+	if (await getReadyWebappDir()) return assetState.webappDir;
+	if (assetState.promise) return assetState.promise;
+	assetState.promise = (async () => {
+		updateAssetState("downloading", "Downloading draw.io assets...");
+		await mkdir(ASSET_CACHE_ROOT, { recursive: true });
+		const tmpDir = path.join(ASSET_CACHE_ROOT, `.tmp-${process.pid}-${Date.now()}`);
+		const archivePath = path.join(tmpDir, ASSET_MANIFEST.archiveName);
+		await rm(tmpDir, { recursive: true, force: true });
+		await mkdir(tmpDir, { recursive: true });
+		try {
+			await downloadAssetArchive(archivePath);
+			updateAssetState("extracting", "Extracting draw.io assets...");
+			const extractDir = path.join(tmpDir, "extract");
+			await mkdir(extractDir, { recursive: true });
+			await extractTarGz(archivePath, extractDir);
+			if (!await directoryHasWebapp(extractDir)) {
+				throw new Error("Downloaded archive did not contain a valid draw.io webapp.");
+			}
+			await rm(ASSET_CACHE_DIR, { recursive: true, force: true });
+			await rename(extractDir, ASSET_CACHE_DIR);
+			await writeFile(ASSET_COMPLETE_FILE, JSON.stringify({
+				version: ASSET_MANIFEST.version,
+				sha256: ASSET_MANIFEST.sha256,
+				installedAt: new Date().toISOString(),
+				source: process.env.DRAWIO_ASSET_URL || ASSET_MANIFEST.downloadUrl,
+			}, null, 2));
+			assetState.webappDir = ASSET_CACHE_DIR;
+			updateAssetState("ready", "draw.io assets are installed.");
+			return assetState.webappDir;
+		} catch (error) {
+			updateAssetState("failed", "Failed to install draw.io assets.", String(error?.message || error));
+			throw error;
+		} finally {
+			assetState.promise = null;
+			await rm(tmpDir, { recursive: true, force: true });
+		}
+	})();
+	return assetState.promise;
+}
 
 function defaultEditorState(title = "Untitled diagram") {
 	return {
@@ -208,6 +436,89 @@ function queueCanvasChromeRefresh(inst) {
 		});
 	}, 0);
 }
+
+function renderAssetLoadingHtml(instanceId) {
+	const payload = assetPayload();
+	return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Installing draw.io assets</title>
+<style>
+	:root { color-scheme: dark; }
+	body {
+		margin: 0;
+		min-height: 100vh;
+		display: grid;
+		place-items: center;
+		background: #1e1e1e;
+		color: #ddd;
+		font: 13px system-ui, sans-serif;
+	}
+	main {
+		width: min(520px, calc(100vw - 48px));
+		background: #252526;
+		border: 1px solid #444;
+		border-radius: 8px;
+		box-shadow: 0 16px 48px rgba(0, 0, 0, 0.35);
+		padding: 20px;
+	}
+	h1 { margin: 0 0 10px; font-size: 18px; }
+	p { margin: 8px 0; color: #bbb; line-height: 1.45; }
+	code { color: #ddd; overflow-wrap: anywhere; }
+	button {
+		margin-top: 14px;
+		background: #0e639c;
+		border: 1px solid #1177bb;
+		border-radius: 4px;
+		color: white;
+		cursor: pointer;
+		padding: 6px 12px;
+	}
+	#error { color: #ff8a8a; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<main>
+	<h1>Installing draw.io assets</h1>
+	<p id="message"></p>
+	<p>Version: <code>${escapeHtml(ASSET_MANIFEST.version)}</code></p>
+	<p id="error"></p>
+	<button id="retry" type="button" hidden>Retry download</button>
+</main>
+<script>
+	const initial = ${JSON.stringify(payload)};
+	const message = document.getElementById("message");
+	const error = document.getElementById("error");
+	const retry = document.getElementById("retry");
+	function render(state) {
+		message.textContent = state.message || "Preparing draw.io assets...";
+		error.textContent = state.error || "";
+		retry.hidden = state.status !== "failed";
+		if (state.status === "ready") {
+			location.replace("/?instanceId=${encodeURIComponent(instanceId)}");
+		}
+	}
+	render(initial);
+	new EventSource("/asset-events").onmessage = (event) => render(JSON.parse(event.data));
+	retry.onclick = async () => {
+		retry.hidden = true;
+		await fetch("/asset-retry", { method: "POST" });
+	};
+</script>
+</body>
+</html>`;
+}
+
+function escapeHtml(value) {
+	return String(value)
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;");
+}
+
 function renderIndexHtml(instanceId) {
 	return `<!doctype html>
 <html>
@@ -706,10 +1017,16 @@ function renderIndexHtml(instanceId) {
 }
 
 async function serveFile(reqPath, res) {
+	const webappDir = await getReadyWebappDir();
+	if (!webappDir) {
+		res.writeHead(503, { "content-type": "text/plain; charset=utf-8" }).end("draw.io assets are not installed yet");
+		return;
+	}
 	const decoded = decodeURIComponent(reqPath);
 	const relative = decoded.replace(/^\/drawio\/?/, "");
-	const filePath = path.resolve(WEBAPP_DIR, relative || "index.html");
-	if (!filePath.startsWith(WEBAPP_DIR + path.sep)) {
+	const filePath = path.resolve(webappDir, relative || "index.html");
+	const relativePath = path.relative(webappDir, filePath);
+	if (relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
 		res.writeHead(403).end("forbidden");
 		return;
 	}
@@ -742,7 +1059,41 @@ async function ensureServer() {
 					return;
 				}
 				res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-				res.end(renderIndexHtml(instanceId));
+				if (await getReadyWebappDir()) {
+					res.end(renderIndexHtml(instanceId));
+				} else {
+					installAssets().catch((error) => {
+						session?.log?.(`Failed to install draw.io assets: ${error?.message || error}`, { level: "warning", ephemeral: true });
+					});
+					res.end(renderAssetLoadingHtml(instanceId));
+				}
+				return;
+			}
+
+			if (req.method === "GET" && url.pathname === "/asset-state") {
+				res.writeHead(200, { "content-type": "application/json" });
+				res.end(JSON.stringify(assetPayload()));
+				return;
+			}
+
+			if (req.method === "GET" && url.pathname === "/asset-events") {
+				res.writeHead(200, {
+					"content-type": "text/event-stream",
+					"cache-control": "no-cache",
+					connection: "keep-alive",
+				});
+				res.write(`data: ${JSON.stringify(assetPayload())}\n\n`);
+				assetSseClients.add(res);
+				req.on("close", () => assetSseClients.delete(res));
+				return;
+			}
+
+			if (req.method === "POST" && url.pathname === "/asset-retry") {
+				installAssets().catch((error) => {
+					session?.log?.(`Failed to install draw.io assets: ${error?.message || error}`, { level: "warning", ephemeral: true });
+				});
+				res.writeHead(202, { "content-type": "application/json" });
+				res.end(JSON.stringify(assetPayload()));
 				return;
 			}
 
@@ -944,6 +1295,12 @@ const canvas = createCanvas({
 	],
 	async open({ extensionId, canvasId, instanceId, input }) {
 		const url = await ensureServer();
+		const assetsReady = Boolean(await getReadyWebappDir());
+		if (!assetsReady) {
+			installAssets().catch((error) => {
+				session?.log?.(`Failed to install draw.io assets: ${error?.message || error}`, { level: "warning", ephemeral: true });
+			});
+		}
 		const inst = getInstance(instanceId);
 		inst.extensionId = extensionId;
 		inst.canvasId = canvasId;
@@ -979,7 +1336,7 @@ const canvas = createCanvas({
 		return {
 			url: `${url}/?instanceId=${encodeURIComponent(instanceId)}`,
 			title: inst.title || "draw.io",
-			status: "ready",
+			status: assetsReady ? "ready" : "installing draw.io assets",
 		};
 	},
 	onClose({ instanceId }) {
