@@ -5,8 +5,8 @@ by the offline [diagrams.net](https://www.diagrams.net/) editor. It lets Copilot
 create, inspect, edit, save, and export draw.io diagrams.
 
 The extension keeps diagrams as standard draw.io XML and supports XML, SVG, and
-PNG exports. The diagrams.net web application is downloaded, checksum-verified,
-and cached locally the first time the canvas opens.
+PNG exports. The diagrams.net web application is packaged with the plugin, so
+the canvas works offline without downloading assets on first use.
 
 ## Install
 
@@ -24,8 +24,8 @@ You can also install the plugin directly from its repository path:
 copilot plugin install cschleiden/canvas-drawio:.github/extensions/drawio
 ```
 
-Start a new Copilot session after installation. The first time you open the
-**draw.io** canvas, Copilot downloads and caches the pinned diagrams.net assets.
+Start a new Copilot session after installation, then ask Copilot to open the
+**draw.io** canvas.
 
 ## Use
 
