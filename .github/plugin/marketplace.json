@@ -1,0 +1,30 @@
+{
+  "name": "canvas-drawio",
+  "owner": {
+    "name": "cschleiden"
+  },
+  "metadata": {
+    "description": "Copilot extensions for creating and editing draw.io diagrams.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "drawio",
+      "source": ".github/extensions/drawio",
+      "description": "Create, inspect, edit, save, and export draw.io diagrams in an interactive Copilot canvas.",
+      "version": "0.1.0",
+      "author": {
+        "name": "cschleiden",
+        "url": "https://github.com/cschleiden"
+      },
+      "homepage": "https://github.com/cschleiden/canvas-drawio",
+      "repository": "https://github.com/cschleiden/canvas-drawio",
+      "keywords": [
+        "canvas",
+        "diagrams",
+        "drawio"
+      ],
+      "category": "productivity"
+    }
+  ]
+}
