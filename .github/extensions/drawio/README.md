@@ -16,9 +16,15 @@ There is deliberately no `package.json` or `node_modules/` here: the Copilot run
 1. `open` lazily starts a single shared loopback HTTP server on `127.0.0.1:<port>` and returns `http://127.0.0.1:<port>/?instanceId=<id>` as the iframe URL. Only loopback URLs are allowed. Opens are idempotent: when the runtime restores a live open-canvas snapshot after an extension reload, the same input rehydrates the canvas from its artifact, file path, or supplied XML.
 2. The served HTML loads the bundled offline diagrams.net webapp with `proto=json`. The editor theme follows the host: the app mirrors its canvas theme contract (`data-color-mode`, `--background-color-default`, `--font-sans`, and friends) onto the canvas document, and the page resolves dark/light from it, live-updating via a `MutationObserver`. Messages from the editor (autosave, save, export) are forwarded to backend endpoints.
 3. Agent-driven commands (`get_editor_state`, `set_diagram`, `export_diagram`) are pushed to the iframe over Server-Sent Events on `/events`. Replies come back through `/iframe-reply` and resolve a per-request promise.
+4. The **Open…** picker reads `GET /diagrams` for the artifact and repo listings and posts the choice to `POST /open`, which binds the instance to that file, pushes a `load` over SSE, and refreshes the canvas title.
 
 The current extension uses the offline bundled draw.io webapp directly and injects artifact commands into draw.io's native **File** menu:
 
+- **File > Open…** lists every diagram the extension can find and loads the selected one. A native OS file dialog is not available inside the canvas iframe, so this is an in-canvas picker over two sources:
+  - **Session artifacts** — `*.drawio` files in the session `files/` artifact directory.
+  - **Repo** — `*.drawio` files under the session working directory (taken from the canvas open request's `session.workingDirectory`, falling back to the extension's cwd). The scan skips dot-directories, `node_modules`, `drawio-webapp`, and common build output directories, and is capped by depth and result count.
+
+  The filter box doubles as a free-text entry, so a path or artifact filename that was not discovered can still be opened. Opening binds the diagram with autosave enabled, so later edits write back to that file. If the current diagram has no backing file and is not empty, the picker confirms before discarding it.
 - **File > Save artifact** writes the current diagram XML to the bound artifact. If the diagram is not bound yet, it asks for an artifact filename.
 - **File > Save as artifact...** always asks for an artifact filename and starts autosaving there.
 - Unsaved diagrams are titled `Untitled diagram (unsaved)` until they are bound to an artifact.

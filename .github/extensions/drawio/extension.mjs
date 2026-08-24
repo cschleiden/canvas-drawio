@@ -1,7 +1,7 @@
 import http from "node:http";
 import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CanvasError, createCanvas, joinSession } from "@github/copilot-sdk/extension";
@@ -9,6 +9,7 @@ import { CanvasError, createCanvas, joinSession } from "@github/copilot-sdk/exte
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WEBAPP_DIR = path.join(__dirname, "drawio-webapp");
 let artifactsDir;
+let workingDirectory = process.cwd();
 let session;
 
 const BLANK_XML = `<mxfile><diagram id="blank" name="Page-1"><mxGraphModel dx="800" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0"><root><mxCell id="0"/><mxCell id="1" parent="0"/></root></mxGraphModel></diagram></mxfile>`;
@@ -186,6 +187,106 @@ async function bindDiagramFile(inst, filePath, { moveExisting = false } = {}) {
 	return { path: inst.filePath, title: inst.title };
 }
 
+async function openExistingDiagram(inst, { artifactName, path: filePath }) {
+	let targetPath;
+	let targetArtifactName = null;
+	if (typeof artifactName === "string" && artifactName.trim()) {
+		({ artifactName: targetArtifactName, filePath: targetPath } = resolveArtifactPath(artifactName));
+	} else {
+		targetPath = resolveDiagramPath(filePath);
+		// A path that lands inside the artifacts directory is an artifact.
+		if (artifactsDir && path.dirname(targetPath) === artifactsDir) {
+			targetArtifactName = path.basename(targetPath);
+		}
+	}
+
+	if (!await fileExists(targetPath)) {
+		throw new CanvasError("not_found", `No diagram found at ${targetPath}`);
+	}
+	const xml = await readFile(targetPath, "utf8");
+	if (!xml.trim()) {
+		throw new CanvasError("invalid_diagram", `${path.basename(targetPath)} is empty.`);
+	}
+
+	inst.xml = xml;
+	inst.filePath = targetPath;
+	inst.artifactName = targetArtifactName;
+	inst.autosave = true;
+	inst.title = targetArtifactName || path.basename(targetPath);
+	inst.editorState = {
+		...inst.editorState,
+		diagram: { ...inst.editorState.diagram, title: inst.title, dirty: false },
+	};
+
+	pushToEditor(inst, {
+		type: "load",
+		xml,
+		title: inst.title,
+		filePath: inst.filePath,
+		artifactName: inst.artifactName,
+		autosave: inst.autosave,
+		saved: true,
+	});
+	queueCanvasChromeRefresh(inst);
+	return { artifactName: inst.artifactName, path: inst.filePath, title: inst.title };
+}
+
+const DIAGRAM_EXTENSION = ".drawio";
+const SCAN_MAX_DEPTH = 8;
+const SCAN_MAX_RESULTS = 500;
+const SCAN_SKIP_DIRECTORIES = new Set(["node_modules", "drawio-webapp", "dist", "build", "out", "target", "vendor"]);
+
+async function listArtifactDiagrams() {
+	if (!artifactsDir) return [];
+	let entries;
+	try {
+		entries = await readdir(artifactsDir, { withFileTypes: true });
+	} catch {
+		return [];
+	}
+	return entries
+		.filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(DIAGRAM_EXTENSION))
+		.map((entry) => ({ artifactName: entry.name, path: path.join(artifactsDir, entry.name) }))
+		.sort((a, b) => a.artifactName.localeCompare(b.artifactName));
+}
+
+async function listRepoDiagrams(root) {
+	if (!root) return [];
+	const found = [];
+	async function walk(dir, depth) {
+		if (depth > SCAN_MAX_DEPTH || found.length >= SCAN_MAX_RESULTS) return;
+		let entries;
+		try {
+			entries = await readdir(dir, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		const subdirectories = [];
+		for (const entry of entries) {
+			if (found.length >= SCAN_MAX_RESULTS) return;
+			if (entry.name.startsWith(".")) continue;
+			const full = path.join(dir, entry.name);
+			if (entry.isDirectory()) {
+				if (!SCAN_SKIP_DIRECTORIES.has(entry.name)) subdirectories.push(full);
+			} else if (entry.isFile() && entry.name.toLowerCase().endsWith(DIAGRAM_EXTENSION)) {
+				found.push({ relativePath: path.relative(root, full), path: full });
+			}
+		}
+		for (const subdirectory of subdirectories) {
+			await walk(subdirectory, depth + 1);
+		}
+	}
+	await walk(root, 0);
+	return found.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+}
+
+async function listDiagrams() {
+	const artifacts = await listArtifactDiagrams();
+	const seen = new Set(artifacts.map((entry) => entry.path));
+	const repo = (await listRepoDiagrams(workingDirectory)).filter((entry) => !seen.has(entry.path));
+	return { artifacts, repo, truncated: repo.length + artifacts.length >= SCAN_MAX_RESULTS };
+}
+
 function currentOpenInput(inst) {
 	const input = { title: inst.title, xml: inst.xml, autosave: inst.autosave, theme: inst.theme };
 	if (inst.artifactName) return { artifactName: inst.artifactName, ...input };
@@ -224,7 +325,8 @@ function renderIndexHtml(inst) {
 <style>
 	body { overflow: hidden; padding: 0; }
 	div.picker { z-index: 10007; }
-	#artifact-modal-backdrop {
+	#artifact-modal-backdrop,
+	#open-modal-backdrop {
 		position: fixed;
 		inset: 0;
 		z-index: 1000000;
@@ -233,7 +335,8 @@ function renderIndexHtml(inst) {
 		align-items: center;
 		justify-content: center;
 	}
-	#artifact-modal {
+	#artifact-modal,
+	#open-modal {
 		width: min(420px, calc(100vw - 48px));
 		background: var(--background-color-default, #252526);
 		color: var(--text-color-default, #dddddd);
@@ -245,13 +348,16 @@ function renderIndexHtml(inst) {
 		line-height: var(--leading-body-medium, 20px);
 		padding: 16px;
 	}
-	#artifact-modal h2 {
+	#open-modal { width: min(560px, calc(100vw - 48px)); }
+	#artifact-modal h2,
+	#open-modal h2 {
 		margin: 0 0 10px;
 		font-size: var(--text-title-small, 15px);
 		font-weight: var(--font-weight-semibold, 600);
 	}
 	#artifact-modal p { margin: 0 0 10px; color: var(--text-color-muted, #aaaaaa); }
-	#artifact-modal input {
+	#artifact-modal input,
+	#open-modal input {
 		width: 100%;
 		box-sizing: border-box;
 		background: transparent;
@@ -262,13 +368,45 @@ function renderIndexHtml(inst) {
 		font-family: inherit;
 		font-size: inherit;
 	}
-	#artifact-modal input:focus-visible {
+	#artifact-modal input:focus-visible,
+	#open-modal input:focus-visible {
 		outline: 2px solid var(--color-focus-outline, #0e639c);
 		outline-offset: 1px;
 	}
-	#artifact-modal-error { min-height: 18px; margin-top: 6px; color: var(--true-color-red, #ff8080); }
-	#artifact-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
-	#artifact-modal button {
+	#open-modal-list {
+		margin-top: 10px;
+		max-height: min(50vh, 320px);
+		overflow-y: auto;
+		border: 1px solid var(--border-color-default, #666666);
+		border-radius: 4px;
+	}
+	#open-modal-list .group {
+		padding: 6px 10px;
+		color: var(--text-color-muted, #aaaaaa);
+		font-weight: var(--font-weight-semibold, 600);
+		border-bottom: 1px solid var(--border-color-default, #666666);
+	}
+	#open-modal-list .group:not(:first-child) { border-top: 1px solid var(--border-color-default, #666666); }
+	#open-modal-list .entry {
+		display: flex;
+		justify-content: space-between;
+		gap: 12px;
+		padding: 6px 10px;
+		cursor: pointer;
+	}
+	#open-modal-list .entry .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	#open-modal-list .entry .badge { color: var(--text-color-muted, #aaaaaa); flex: none; }
+	#open-modal-list .entry[aria-selected="true"] {
+		outline: 2px solid var(--color-focus-outline, #0e639c);
+		outline-offset: -2px;
+	}
+	#open-modal-list .empty { padding: 10px; color: var(--text-color-muted, #aaaaaa); }
+	#artifact-modal-error,
+	#open-modal-error { min-height: 18px; margin-top: 6px; color: var(--true-color-red, #ff8080); }
+	#artifact-modal-actions,
+	#open-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+	#artifact-modal button,
+	#open-modal button {
 		background: transparent;
 		color: var(--text-color-default, #dddddd);
 		border: 1px solid var(--border-color-default, #666666);
@@ -278,7 +416,8 @@ function renderIndexHtml(inst) {
 		font-size: inherit;
 		cursor: pointer;
 	}
-	#artifact-modal button.primary {
+	#artifact-modal button.primary,
+	#open-modal button.primary {
 		background: var(--true-color-blue, #0e639c);
 		border-color: var(--true-color-blue, #1177bb);
 		color: var(--color-white, #ffffff);
@@ -459,6 +598,139 @@ function renderIndexHtml(inst) {
 		});
 	}
 
+	async function pickDiagram() {
+		const backdrop = document.getElementById("open-modal-backdrop");
+		const filter = document.getElementById("open-modal-filter");
+		const list = document.getElementById("open-modal-list");
+		const error = document.getElementById("open-modal-error");
+		const ok = document.getElementById("open-modal-ok");
+		const cancel = document.getElementById("open-modal-cancel");
+
+		let entries = [];
+		let visible = [];
+		let selectedIndex = 0;
+		let submit = () => {};
+
+		error.textContent = "";
+		filter.value = "";
+		list.innerHTML = '<div class="empty">Loading\\u2026</div>';
+		backdrop.style.display = "flex";
+		filter.focus();
+
+		try {
+			const response = await fetch("/diagrams?instanceId=" + encodeURIComponent(instanceId));
+			const data = await response.json();
+			entries = [
+				...data.artifacts.map((entry) => ({ label: entry.artifactName, group: "Session artifacts", request: { artifactName: entry.artifactName } })),
+				...data.repo.map((entry) => ({ label: entry.relativePath, group: "Repo", request: { path: entry.path } })),
+			];
+			if (data.truncated) {
+				error.textContent = "Showing the first matches only; type a path to open anything else.";
+			}
+		} catch (e) {
+			error.textContent = "Could not list diagrams: " + String(e.message || e);
+		}
+
+		function renderList() {
+			const needle = filter.value.trim().toLowerCase();
+			visible = needle ? entries.filter((entry) => entry.label.toLowerCase().includes(needle)) : entries.slice();
+			selectedIndex = Math.min(selectedIndex, Math.max(visible.length - 1, 0));
+			if (visible.length === 0) {
+				const hint = filter.value.trim()
+					? "No match. Press Enter to open this path."
+					: "No .drawio diagrams found.";
+				list.innerHTML = '<div class="empty"></div>';
+				list.firstChild.textContent = hint;
+				return;
+			}
+			list.textContent = "";
+			let group = null;
+			visible.forEach((entry, index) => {
+				if (entry.group !== group) {
+					group = entry.group;
+					const header = document.createElement("div");
+					header.className = "group";
+					header.textContent = group;
+					list.appendChild(header);
+				}
+				const row = document.createElement("div");
+				row.className = "entry";
+				row.setAttribute("role", "option");
+				row.setAttribute("aria-selected", String(index === selectedIndex));
+				const name = document.createElement("span");
+				name.className = "name";
+				name.textContent = entry.label;
+				row.appendChild(name);
+				row.onclick = () => {
+					selectedIndex = index;
+					submit();
+				};
+				list.appendChild(row);
+				if (index === selectedIndex) row.scrollIntoView({ block: "nearest" });
+			});
+		}
+
+		return new Promise((resolve) => {
+			const cleanup = (value) => {
+				backdrop.style.display = "none";
+				ok.onclick = null;
+				cancel.onclick = null;
+				filter.oninput = null;
+				filter.onkeydown = null;
+				resolve(value);
+			};
+			submit = () => {
+				const typed = filter.value.trim();
+				const entry = visible[selectedIndex];
+				if (entry) return cleanup(entry.request);
+				if (!typed) {
+					error.textContent = "Select a diagram or type a path.";
+					return;
+				}
+				cleanup(typed.includes("/") || typed.includes("\\\\") ? { path: typed } : { artifactName: typed });
+			};
+			ok.onclick = submit;
+			cancel.onclick = () => cleanup(null);
+			filter.oninput = () => {
+				selectedIndex = 0;
+				error.textContent = "";
+				renderList();
+			};
+			filter.onkeydown = (event) => {
+				if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+					event.preventDefault();
+					if (visible.length === 0) return;
+					selectedIndex = (selectedIndex + (event.key === "ArrowDown" ? 1 : -1) + visible.length) % visible.length;
+					renderList();
+					return;
+				}
+				if (event.key === "Enter") submit();
+				if (event.key === "Escape") cleanup(null);
+			};
+			renderList();
+		});
+	}
+
+	function diagramHasContent() {
+		const model = editorUi?.editor?.graph?.getModel?.();
+		if (!model) return false;
+		return Object.keys(model.cells || {}).some((id) => id !== "0" && id !== "1");
+	}
+
+	async function openDiagram() {
+		if (!hasBackingFile && diagramHasContent()) {
+			const proceed = confirm("The current diagram is not saved. Opening another diagram discards it. Continue?");
+			if (!proceed) return;
+		}
+		const request = await pickDiagram();
+		if (!request) return;
+		const response = await sendBackend("/open", { instanceId, ...request });
+		const result = await response.json();
+		if (!result.ok) throw new Error(result.error || "Open failed");
+		syncFileState({ artifactName: result.artifactName, filePath: result.path, title: result.title, autosave: true });
+		markEditorSaved(result.title);
+	}
+
 	async function saveArtifact() {
 		const artifactName = currentArtifactName || await askArtifactName("Save artifact filename", "diagram.drawio");
 		if (!artifactName) return;
@@ -485,6 +757,9 @@ function renderIndexHtml(inst) {
 			if (typeof menu.addSeparator === "function") {
 				menu.addSeparator(parent);
 			}
+			menu.addItem("Open...", null, () => {
+				openDiagram().catch((e) => alert(String(e.message || e)));
+			}, parent);
 			menu.addItem("Save", null, () => {
 				saveArtifact().catch((e) => alert(String(e.message || e)));
 			}, parent);
@@ -620,6 +895,18 @@ function renderIndexHtml(inst) {
 		<div id="artifact-modal-actions">
 			<button id="artifact-modal-cancel" type="button">Cancel</button>
 			<button id="artifact-modal-ok" class="primary" type="button">Save</button>
+		</div>
+	</div>
+</div>
+<div id="open-modal-backdrop">
+	<div id="open-modal" role="dialog" aria-modal="true" aria-labelledby="open-modal-title">
+		<h2 id="open-modal-title">Open diagram</h2>
+		<input id="open-modal-filter" autocomplete="off" spellcheck="false" placeholder="Filter, or type a path" aria-controls="open-modal-list" />
+		<div id="open-modal-list" role="listbox" aria-labelledby="open-modal-title"></div>
+		<div id="open-modal-error"></div>
+		<div id="open-modal-actions">
+			<button id="open-modal-cancel" type="button">Cancel</button>
+			<button id="open-modal-ok" class="primary" type="button">Open</button>
 		</div>
 	</div>
 </div>
@@ -838,6 +1125,34 @@ async function ensureServer() {
 				return;
 			}
 
+			if (req.method === "GET" && url.pathname === "/diagrams") {
+				const inst = getInstance(instanceId);
+				const { artifacts, repo, truncated } = await listDiagrams();
+				res.writeHead(200, { "content-type": "application/json" });
+				res.end(JSON.stringify({
+					artifacts,
+					repo,
+					truncated,
+					workingDirectory,
+					current: { artifactName: inst.artifactName, path: inst.filePath },
+				}));
+				return;
+			}
+
+			if (req.method === "POST" && url.pathname === "/open") {
+				const body = await readJsonBody(req);
+				const inst = getInstance(body.instanceId);
+				try {
+					const result = await openExistingDiagram(inst, body);
+					res.writeHead(200, { "content-type": "application/json" });
+					res.end(JSON.stringify({ ok: true, ...result }));
+				} catch (error) {
+					res.writeHead(400, { "content-type": "application/json" });
+					res.end(JSON.stringify({ ok: false, error: String(error?.message || error) }));
+				}
+				return;
+			}
+
 			if (req.method === "GET" && url.pathname === "/events") {
 				const inst = getInstance(instanceId);
 				res.writeHead(200, {
@@ -991,7 +1306,10 @@ const canvas = createCanvas({
 			},
 		},
 	],
-	async open({ extensionId, canvasId, instanceId, input }) {
+	async open({ extensionId, canvasId, instanceId, input, session: sessionContext }) {
+		if (typeof sessionContext?.workingDirectory === "string" && sessionContext.workingDirectory) {
+			workingDirectory = sessionContext.workingDirectory;
+		}
 		const url = await ensureServer();
 		const inst = getInstance(instanceId);
 		inst.extensionId = extensionId;
