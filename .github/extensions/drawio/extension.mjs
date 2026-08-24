@@ -330,97 +330,153 @@ function renderIndexHtml(inst) {
 		position: fixed;
 		inset: 0;
 		z-index: 1000000;
-		background: rgba(0, 0, 0, 0.55);
+		background: var(--background-color-overlay-backdrop, rgba(0, 0, 0, 0.5));
 		display: none;
 		align-items: center;
 		justify-content: center;
+		padding: 16px;
 	}
 	#artifact-modal,
 	#open-modal {
-		width: min(420px, calc(100vw - 48px));
-		background: var(--background-color-default, #252526);
-		color: var(--text-color-default, #dddddd);
-		border: 1px solid var(--border-color-default, #555555);
-		border-radius: 8px;
-		box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
-		font-family: var(--font-sans, system-ui, sans-serif);
-		font-size: var(--text-body-medium, 13px);
+		display: flex;
+		flex-direction: column;
+		width: min(440px, 100%);
+		max-height: min(560px, 100%);
+		box-sizing: border-box;
+		background: var(--background-color-overlay, #ffffff);
+		color: var(--text-color-default, #1f2328);
+		border: 1px solid var(--border-color-overlay, var(--border-color-default, #d1d9e0));
+		border-radius: 12px;
+		box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15), 0 1px 3px rgba(0, 0, 0, 0.12);
+		font-family: var(--font-sans, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
+		font-size: var(--text-body-medium, 14px);
 		line-height: var(--leading-body-medium, 20px);
 		padding: 16px;
+		gap: 12px;
 	}
-	#open-modal { width: min(560px, calc(100vw - 48px)); }
 	#artifact-modal h2,
 	#open-modal h2 {
-		margin: 0 0 10px;
-		font-size: var(--text-title-small, 15px);
+		margin: 0;
+		font-size: var(--text-title-small, 16px);
+		line-height: var(--leading-title-small, 24px);
 		font-weight: var(--font-weight-semibold, 600);
 	}
-	#artifact-modal p { margin: 0 0 10px; color: var(--text-color-muted, #aaaaaa); }
+	#artifact-modal p {
+		margin: -4px 0 0;
+		color: var(--text-color-muted, #59636e);
+		font-size: var(--text-body-small, 12px);
+		line-height: var(--leading-body-small, 18px);
+	}
 	#artifact-modal input,
 	#open-modal input {
 		width: 100%;
 		box-sizing: border-box;
-		background: transparent;
-		color: var(--text-color-default, #dddddd);
-		border: 1px solid var(--border-color-default, #666666);
-		border-radius: 4px;
-		padding: 7px 8px;
-		font-family: inherit;
-		font-size: inherit;
-	}
-	#artifact-modal input:focus-visible,
-	#open-modal input:focus-visible {
-		outline: 2px solid var(--color-focus-outline, #0e639c);
-		outline-offset: 1px;
-	}
-	#open-modal-list {
-		margin-top: 10px;
-		max-height: min(50vh, 320px);
-		overflow-y: auto;
-		border: 1px solid var(--border-color-default, #666666);
-		border-radius: 4px;
-	}
-	#open-modal-list .group {
-		padding: 6px 10px;
-		color: var(--text-color-muted, #aaaaaa);
-		font-weight: var(--font-weight-semibold, 600);
-		border-bottom: 1px solid var(--border-color-default, #666666);
-	}
-	#open-modal-list .group:not(:first-child) { border-top: 1px solid var(--border-color-default, #666666); }
-	#open-modal-list .entry {
-		display: flex;
-		justify-content: space-between;
-		gap: 12px;
-		padding: 6px 10px;
-		cursor: pointer;
-	}
-	#open-modal-list .entry .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-	#open-modal-list .entry .badge { color: var(--text-color-muted, #aaaaaa); flex: none; }
-	#open-modal-list .entry[aria-selected="true"] {
-		outline: 2px solid var(--color-focus-outline, #0e639c);
-		outline-offset: -2px;
-	}
-	#open-modal-list .empty { padding: 10px; color: var(--text-color-muted, #aaaaaa); }
-	#artifact-modal-error,
-	#open-modal-error { min-height: 18px; margin-top: 6px; color: var(--true-color-red, #ff8080); }
-	#artifact-modal-actions,
-	#open-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
-	#artifact-modal button,
-	#open-modal button {
-		background: transparent;
-		color: var(--text-color-default, #dddddd);
-		border: 1px solid var(--border-color-default, #666666);
-		border-radius: 4px;
+		background: var(--background-color-control-rest, transparent);
+		color: var(--text-color-control-rest, var(--text-color-default, #1f2328));
+		border: 1px solid var(--border-color-control-rest, var(--border-color-default, #d1d9e0));
+		border-radius: 6px;
 		padding: 5px 12px;
 		font-family: inherit;
 		font-size: inherit;
+		line-height: inherit;
+	}
+	#artifact-modal input::placeholder,
+	#open-modal input::placeholder {
+		color: var(--text-color-control-placeholder, var(--text-color-muted, #59636e));
+	}
+	#artifact-modal input:focus-visible,
+	#open-modal input:focus-visible,
+	#artifact-modal button:focus-visible,
+	#open-modal button:focus-visible {
+		outline: 2px solid var(--outline-color-focus-default, var(--color-focus-outline, #0969da));
+		outline-offset: -1px;
+	}
+	#open-modal-list {
+		flex: 1 1 auto;
+		min-height: 0;
+		overflow-y: auto;
+		margin: 0 -4px;
+		padding: 0 4px;
+	}
+	#open-modal-list .group {
+		padding: 8px 8px 4px;
+		color: var(--text-color-muted, #59636e);
+		font-size: var(--text-caption, 12px);
+		line-height: var(--leading-caption, 16px);
+		font-weight: var(--font-weight-semibold, 600);
+	}
+	#open-modal-list .group:first-child { padding-top: 0; }
+	#open-modal-list .entry {
+		display: flex;
+		align-items: baseline;
+		gap: 8px;
+		padding: 5px 8px;
+		border-radius: 6px;
 		cursor: pointer;
+		user-select: none;
+	}
+	#open-modal-list .entry:hover {
+		background: var(--background-color-control-transparent-hover, rgba(0, 0, 0, 0.05));
+	}
+	#open-modal-list .entry[aria-selected="true"] {
+		background: var(--background-color-control-transparent-selected, rgba(0, 0, 0, 0.08));
+	}
+	#open-modal-list .entry .name {
+		flex: 0 1 auto;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	#open-modal-list .entry .badge {
+		flex: 1 1 auto;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		color: var(--text-color-muted, #59636e);
+		font-size: var(--text-body-small, 12px);
+	}
+	#open-modal-list .empty {
+		padding: 12px 8px;
+		color: var(--text-color-muted, #59636e);
+		font-size: var(--text-body-small, 12px);
+	}
+	#artifact-modal-error,
+	#open-modal-error {
+		color: var(--text-color-danger, var(--true-color-red, #d1242f));
+		font-size: var(--text-body-small, 12px);
+		line-height: var(--leading-body-small, 18px);
+	}
+	#artifact-modal-error:empty,
+	#open-modal-error:empty { display: none; }
+	#artifact-modal-actions,
+	#open-modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+	#artifact-modal button,
+	#open-modal button {
+		background: var(--background-color-button-default-rest, transparent);
+		color: var(--text-color-button-default-rest, var(--text-color-default, #1f2328));
+		border: 1px solid var(--border-color-button-default-rest, var(--border-color-default, #d1d9e0));
+		border-radius: 6px;
+		padding: 5px 12px;
+		font-family: inherit;
+		font-size: var(--text-body-medium, 14px);
+		line-height: var(--leading-body-medium, 20px);
+		font-weight: var(--font-weight-medium, 500);
+		cursor: pointer;
+	}
+	#artifact-modal button:hover,
+	#open-modal button:hover {
+		background: var(--background-color-button-default-hover, rgba(0, 0, 0, 0.05));
 	}
 	#artifact-modal button.primary,
 	#open-modal button.primary {
-		background: var(--true-color-blue, #0e639c);
-		border-color: var(--true-color-blue, #1177bb);
-		color: var(--color-white, #ffffff);
+		background: var(--background-color-button-primary-rest, #1f883d);
+		border-color: var(--border-color-button-primary-rest, transparent);
+		color: var(--text-color-button-primary-rest, #ffffff);
+	}
+	#artifact-modal button.primary:hover,
+	#open-modal button.primary:hover {
+		background: var(--background-color-button-primary-hover, #1a7f37);
 	}
 	.geSidebarContainer .geTitle input { font-size: 8pt; color: #606060; }
 	.geBlock { z-index: -3; margin: 100px; margin-top: 40px; margin-bottom: 30px; padding: 20px; text-align: center; min-width: 50%; }
@@ -621,8 +677,23 @@ function renderIndexHtml(inst) {
 			const response = await fetch("/diagrams?instanceId=" + encodeURIComponent(instanceId));
 			const data = await response.json();
 			entries = [
-				...data.artifacts.map((entry) => ({ label: entry.artifactName, group: "Session artifacts", request: { artifactName: entry.artifactName } })),
-				...data.repo.map((entry) => ({ label: entry.relativePath, group: "Repo", request: { path: entry.path } })),
+				...data.artifacts.map((entry) => ({
+					label: entry.artifactName,
+					name: entry.artifactName,
+					detail: "",
+					group: "Session artifacts",
+					request: { artifactName: entry.artifactName },
+				})),
+				...data.repo.map((entry) => {
+					const slash = entry.relativePath.lastIndexOf("/");
+					return {
+						label: entry.relativePath,
+						name: slash === -1 ? entry.relativePath : entry.relativePath.slice(slash + 1),
+						detail: slash === -1 ? "" : entry.relativePath.slice(0, slash),
+						group: "Repo",
+						request: { path: entry.path },
+					};
+				}),
 			];
 			if (data.truncated) {
 				error.textContent = "Showing the first matches only; type a path to open anything else.";
@@ -659,8 +730,14 @@ function renderIndexHtml(inst) {
 				row.setAttribute("aria-selected", String(index === selectedIndex));
 				const name = document.createElement("span");
 				name.className = "name";
-				name.textContent = entry.label;
+				name.textContent = entry.name;
 				row.appendChild(name);
+				if (entry.detail) {
+					const detail = document.createElement("span");
+					detail.className = "badge";
+					detail.textContent = entry.detail;
+					row.appendChild(detail);
+				}
 				row.onclick = () => {
 					selectedIndex = index;
 					submit();
