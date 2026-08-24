@@ -5,15 +5,16 @@ A Copilot CLI extension that contributes a canvas embedding [diagrams.net](https
 ## Files
 
 - `extension.mjs` — Copilot CLI extension entrypoint; declares the `drawio` canvas via `@github/copilot-sdk/extension` and serves the iframe bridge from a loopback HTTP server.
-- `index.js` — legacy standalone entry kept in sync with `extension.mjs` for older local testing flows.
-- `package.json` — optional Node ESM metadata for local standalone testing. The Copilot runtime supplies `@github/copilot-sdk`; do not vendor or pin it here.
+- `standalone.mjs` — optional local harness that serves the bundled webapp without the Copilot runtime, for asset debugging.
 - `copilot-extension.json` — extension manifest (`entry: node extension.mjs`).
 - `drawio-webapp/` — vendored offline diagrams.net assets, copied from the root `drawio` git submodule by `scripts/sync-drawio-webapp.sh`.
+
+There is deliberately no `package.json` or `node_modules/` here: the Copilot runtime resolves `@github/copilot-sdk` for the extension, and adding a manifest to pin it is unsupported.
 
 ## How it works
 
 1. `open` lazily starts a single shared loopback HTTP server on `127.0.0.1:<port>` and returns `http://127.0.0.1:<port>/?instanceId=<id>` as the iframe URL. Only loopback URLs are allowed. Opens are idempotent: when the runtime restores a live open-canvas snapshot after an extension reload, the same input rehydrates the canvas from its artifact, file path, or supplied XML.
-2. The served HTML loads the bundled offline diagrams.net webapp with `proto=json` and dark UI. Messages from the editor (autosave, save, export) are forwarded to backend endpoints.
+2. The served HTML loads the bundled offline diagrams.net webapp with `proto=json`. The editor theme follows the host: the app mirrors its canvas theme contract (`data-color-mode`, `--background-color-default`, `--font-sans`, and friends) onto the canvas document, and the page resolves dark/light from it, live-updating via a `MutationObserver`. Messages from the editor (autosave, save, export) are forwarded to backend endpoints.
 3. Agent-driven commands (`get_editor_state`, `set_diagram`, `export_diagram`) are pushed to the iframe over Server-Sent Events on `/events`. Replies come back through `/iframe-reply` and resolve a per-request promise.
 
 The current extension uses the offline bundled draw.io webapp directly and injects artifact commands into draw.io's native **File** menu:
@@ -27,8 +28,9 @@ The current extension uses the offline bundled draw.io webapp directly and injec
 | Action | Input | Result |
 | --- | --- | --- |
 | `get_editor_state` | _none_ | `{ diagram, selection, viewport }` — high-level editor context |
-| `set_diagram` | `{ xml, title? }` | Replaces the current diagram with complete mxGraphModel or mxfile XML |
+| `set_diagram` | `{ xml, title?, path?, autosave? }` | Replaces the current diagram with complete mxGraphModel or mxfile XML |
 | `export_diagram` | `{ format }` where format is `xml`, `svg`, `xmlsvg`, `png`, or `xmlpng` | `{ format, content }` — XML text or image data URI |
+| `get_page_title` | _none_ | `{ title }` — the current `document.title` inside the draw.io iframe |
 
 Per-canvas open input:
 
@@ -39,9 +41,12 @@ Per-canvas open input:
   "xml": "<mxfile>...</mxfile>",
   "title": "My diagram",
   "autosave": true,
-  "theme": "dark"
+  "readOnly": false,
+  "theme": "auto"
 }
 ```
+
+`theme` defaults to `auto`, which follows the host app's color mode. Use `light` or `dark` to pin it. `readOnly` opens the diagram in the diagrams.net viewer (no editing chrome, no autosave, no artifact **File** menu entries).
 
 Use `artifactName` to bind the canvas to a `.drawio` XML file under the session `files/` artifact directory. If the artifact exists, it is loaded on open. If both `artifactName` and `xml` are supplied, the XML is loaded and written to the artifact. With `autosave: true` (default), editor autosaves and `set_diagram` updates are written back to the artifact.
 

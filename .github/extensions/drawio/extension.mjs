@@ -50,6 +50,8 @@ function getInstance(instanceId) {
 			filePath: null,
 			artifactName: null,
 			autosave: true,
+			theme: "auto",
+			readOnly: false,
 			extensionId: null,
 			canvasId: "drawio",
 			editorState: defaultEditorState(),
@@ -186,10 +188,10 @@ async function bindDiagramFile(inst, filePath, { moveExisting = false } = {}) {
 }
 
 function currentOpenInput(inst) {
-	const input = { title: inst.title, xml: inst.xml, autosave: inst.autosave };
+	const input = { title: inst.title, xml: inst.xml, autosave: inst.autosave, theme: inst.theme, readOnly: inst.readOnly };
 	if (inst.artifactName) return { artifactName: inst.artifactName, ...input };
 	if (inst.filePath) return { path: inst.filePath, ...input };
-	return { title: inst.title };
+	return { title: inst.title, theme: inst.theme, readOnly: inst.readOnly };
 }
 async function refreshCanvasChrome(inst) {
 	const request = {
@@ -208,7 +210,8 @@ function queueCanvasChromeRefresh(inst) {
 		});
 	}, 0);
 }
-function renderIndexHtml(instanceId) {
+function renderIndexHtml(inst) {
+	const instanceId = inst.instanceId;
 	return `<!doctype html>
 <html>
 <head>
@@ -233,36 +236,54 @@ function renderIndexHtml(instanceId) {
 	}
 	#artifact-modal {
 		width: min(420px, calc(100vw - 48px));
-		background: #252526;
-		color: #ddd;
-		border: 1px solid #555;
+		background: var(--background-color-default, #252526);
+		color: var(--text-color-default, #dddddd);
+		border: 1px solid var(--border-color-default, #555555);
 		border-radius: 8px;
 		box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
-		font: 13px system-ui, sans-serif;
+		font-family: var(--font-sans, system-ui, sans-serif);
+		font-size: var(--text-body-medium, 13px);
+		line-height: var(--leading-body-medium, 20px);
 		padding: 16px;
 	}
-	#artifact-modal h2 { margin: 0 0 10px; font-size: 15px; font-weight: 600; }
-	#artifact-modal p { margin: 0 0 10px; color: #aaa; }
+	#artifact-modal h2 {
+		margin: 0 0 10px;
+		font-size: var(--text-title-small, 15px);
+		font-weight: var(--font-weight-semibold, 600);
+	}
+	#artifact-modal p { margin: 0 0 10px; color: var(--text-color-muted, #aaaaaa); }
 	#artifact-modal input {
 		width: 100%;
 		box-sizing: border-box;
-		background: #1e1e1e;
-		color: #ddd;
-		border: 1px solid #666;
+		background: transparent;
+		color: var(--text-color-default, #dddddd);
+		border: 1px solid var(--border-color-default, #666666);
 		border-radius: 4px;
 		padding: 7px 8px;
+		font-family: inherit;
+		font-size: inherit;
 	}
-	#artifact-modal-error { min-height: 18px; margin-top: 6px; color: #ff8080; }
+	#artifact-modal input:focus-visible {
+		outline: 2px solid var(--color-focus-outline, #0e639c);
+		outline-offset: 1px;
+	}
+	#artifact-modal-error { min-height: 18px; margin-top: 6px; color: var(--true-color-red, #ff8080); }
 	#artifact-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
 	#artifact-modal button {
-		background: #333;
-		color: #ddd;
-		border: 1px solid #666;
+		background: transparent;
+		color: var(--text-color-default, #dddddd);
+		border: 1px solid var(--border-color-default, #666666);
 		border-radius: 4px;
 		padding: 5px 12px;
+		font-family: inherit;
+		font-size: inherit;
 		cursor: pointer;
 	}
-	#artifact-modal button.primary { background: #0e639c; border-color: #1177bb; color: white; }
+	#artifact-modal button.primary {
+		background: var(--true-color-blue, #0e639c);
+		border-color: var(--true-color-blue, #1177bb);
+		color: var(--color-white, #ffffff);
+	}
 	.geSidebarContainer .geTitle input { font-size: 8pt; color: #606060; }
 	.geBlock { z-index: -3; margin: 100px; margin-top: 40px; margin-bottom: 30px; padding: 20px; text-align: center; min-width: 50%; }
 	.geBlock h1, .geBlock h2 { margin-top: 0; padding-top: 0; }
@@ -523,18 +544,37 @@ function renderIndexHtml(instanceId) {
 	});
 
 	const appearance = 1;
-	const theme = "dark";
+	const themePreference = ${JSON.stringify(inst.theme || "auto")};
+	const readOnly = ${JSON.stringify(inst.readOnly === true)};
+
+	// The host mirrors its theme contract (data-color-mode / data-dark-theme)
+	// onto this document, so "auto" follows the app instead of a fixed value.
+	function hostPrefersDark() {
+		if (themePreference === "dark") return true;
+		if (themePreference === "light") return false;
+		const mode = document.documentElement.getAttribute("data-color-mode")
+			|| document.body?.getAttribute("data-color-mode");
+		if (mode === "dark") return true;
+		if (mode === "light") return false;
+		return window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? true;
+	}
+
+	let darkMode = hostPrefersDark();
+	const theme = darkMode ? "dark" : "kennedy";
 	const urlParams = {
 		embed: "1",
 		configure: "1",
 		proto: "json",
 		ui: theme,
-		dark: "1",
+		dark: darkMode ? "1" : "0",
 		lang: "en",
 		noSaveBtn: "1",
 		noExitBtn: "1",
-		chrome: "1",
+		chrome: readOnly ? "0" : "1",
 	};
+	if (readOnly) {
+		urlParams.lightbox = "1";
+	}
 
 	function mxscript(src, onLoad, id, dataAppKey, noWrite) {
 		if (onLoad != null || noWrite) {
@@ -607,14 +647,14 @@ function renderIndexHtml(instanceId) {
 		if (msg.event === "configure") {
 			window.postMessage(JSON.stringify({
 				action: "configure",
-				config: { compressXml: false, defaultLibraries: "general", libraries: "general", ui: "dark" },
+				config: { compressXml: false, defaultLibraries: "general", libraries: "general", ui: theme },
 			}), "*");
 		} else if (msg.event === "init") {
 			const r = await fetch("/state?instanceId=" + encodeURIComponent(instanceId));
 			const state = await r.json();
 			const { xml } = state;
 			syncFileState(state);
-			window.postMessage(JSON.stringify({ action: "load", xml, autosave: 1 }), "*");
+			window.postMessage(JSON.stringify({ action: "load", xml, autosave: readOnly ? 0 : 1 }), "*");
 			if (hasBackingFile) {
 				setTimeout(() => markEditorSaved(currentSavedTitle), 0);
 			}
@@ -653,7 +693,7 @@ function renderIndexHtml(instanceId) {
 		editorUi = this;
 		window.editorUi = this;
 		const result = old.apply(this, args);
-		installArtifactFileMenu(this);
+		if (!readOnly) installArtifactFileMenu(this);
 		if (hasBackingFile) {
 			setTimeout(() => markEditorSaved(currentSavedTitle), 0);
 		} else {
@@ -671,12 +711,27 @@ function renderIndexHtml(instanceId) {
 	};
 	App.main();
 
+	function syncHostTheme() {
+		const dark = hostPrefersDark();
+		if (dark === darkMode) return;
+		darkMode = dark;
+		editorUi?.setDarkMode?.(dark);
+	}
+
+	if (themePreference === "auto") {
+		new MutationObserver(syncHostTheme).observe(document.documentElement, {
+			attributes: true,
+			attributeFilter: ["data-color-mode", "data-dark-theme", "data-light-theme"],
+		});
+		window.matchMedia?.("(prefers-color-scheme: dark)").addEventListener?.("change", syncHostTheme);
+	}
+
 	const sse = new EventSource("/events?instanceId=" + encodeURIComponent(instanceId));
 	sse.onmessage = async (e) => {
 		const cmd = JSON.parse(e.data);
 		if (cmd.type === "load") {
 			syncFileState(cmd);
-			window.postMessage(JSON.stringify({ action: "load", xml: cmd.xml, autosave: 1 }), "*");
+			window.postMessage(JSON.stringify({ action: "load", xml: cmd.xml, autosave: readOnly ? 0 : 1 }), "*");
 			if (cmd.saved === false) {
 				lastDirty = true;
 			} else if (hasBackingFile) {
@@ -742,7 +797,7 @@ async function ensureServer() {
 					return;
 				}
 				res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-				res.end(renderIndexHtml(instanceId));
+				res.end(renderIndexHtml(getInstance(instanceId)));
 				return;
 			}
 
@@ -852,8 +907,8 @@ const canvas = createCanvas({
 			path: { type: "string", description: "Optional .drawio file path to read from and autosave back to." },
 			autosave: { type: "boolean", description: "When path is set, write editor autosaves and set_diagram changes back to the file. Defaults to true." },
 			title: { type: "string", description: "Optional diagram title." },
-			readOnly: { type: "boolean", description: "Whether to open the diagram in read-only mode." },
-			theme: { enum: ["auto", "light", "dark"], description: "Initial editor theme preference." },
+			readOnly: { type: "boolean", description: "Open the diagram in read-only viewer mode. Defaults to false." },
+			theme: { enum: ["auto", "light", "dark"], description: "Editor theme. Defaults to auto, which follows the host app theme." },
 		},
 	},
 	actions: [
@@ -947,6 +1002,8 @@ const canvas = createCanvas({
 		const inst = getInstance(instanceId);
 		inst.extensionId = extensionId;
 		inst.canvasId = canvasId;
+		if (input && typeof input.theme === "string") inst.theme = input.theme;
+		if (input && typeof input.readOnly === "boolean") inst.readOnly = input.readOnly;
 		if (input && typeof input.artifactName === "string") {
 			const { artifactName, filePath } = resolveArtifactPath(input.artifactName);
 			inst.artifactName = artifactName;
