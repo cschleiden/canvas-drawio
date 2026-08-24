@@ -41,12 +41,11 @@ Per-canvas open input:
   "xml": "<mxfile>...</mxfile>",
   "title": "My diagram",
   "autosave": true,
-  "readOnly": false,
   "theme": "auto"
 }
 ```
 
-`theme` defaults to `auto`, which follows the host app's color mode. Use `light` or `dark` to pin it. `readOnly` opens the diagram in the diagrams.net viewer (no editing chrome, no autosave, no artifact **File** menu entries).
+`theme` defaults to `auto`, which follows the host app's color mode. Use `light` or `dark` to pin it.
 
 Use `artifactName` to bind the canvas to a `.drawio` XML file under the session `files/` artifact directory. If the artifact exists, it is loaded on open. If both `artifactName` and `xml` are supplied, the XML is loaded and written to the artifact. With `autosave: true` (default), editor autosaves and `set_diagram` updates are written back to the artifact.
 

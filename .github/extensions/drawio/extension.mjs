@@ -51,7 +51,6 @@ function getInstance(instanceId) {
 			artifactName: null,
 			autosave: true,
 			theme: "auto",
-			readOnly: false,
 			extensionId: null,
 			canvasId: "drawio",
 			editorState: defaultEditorState(),
@@ -188,10 +187,10 @@ async function bindDiagramFile(inst, filePath, { moveExisting = false } = {}) {
 }
 
 function currentOpenInput(inst) {
-	const input = { title: inst.title, xml: inst.xml, autosave: inst.autosave, theme: inst.theme, readOnly: inst.readOnly };
+	const input = { title: inst.title, xml: inst.xml, autosave: inst.autosave, theme: inst.theme };
 	if (inst.artifactName) return { artifactName: inst.artifactName, ...input };
 	if (inst.filePath) return { path: inst.filePath, ...input };
-	return { title: inst.title, theme: inst.theme, readOnly: inst.readOnly };
+	return { title: inst.title, theme: inst.theme };
 }
 async function refreshCanvasChrome(inst) {
 	const request = {
@@ -545,7 +544,6 @@ function renderIndexHtml(inst) {
 
 	const appearance = 1;
 	const themePreference = ${JSON.stringify(inst.theme || "auto")};
-	const readOnly = ${JSON.stringify(inst.readOnly === true)};
 
 	// The host mirrors its theme contract (data-color-mode / data-dark-theme)
 	// onto this document, so "auto" follows the app instead of a fixed value.
@@ -570,11 +568,8 @@ function renderIndexHtml(inst) {
 		lang: "en",
 		noSaveBtn: "1",
 		noExitBtn: "1",
-		chrome: readOnly ? "0" : "1",
+		chrome: "1",
 	};
-	if (readOnly) {
-		urlParams.lightbox = "1";
-	}
 
 	function mxscript(src, onLoad, id, dataAppKey, noWrite) {
 		if (onLoad != null || noWrite) {
@@ -654,7 +649,7 @@ function renderIndexHtml(inst) {
 			const state = await r.json();
 			const { xml } = state;
 			syncFileState(state);
-			window.postMessage(JSON.stringify({ action: "load", xml, autosave: readOnly ? 0 : 1 }), "*");
+			window.postMessage(JSON.stringify({ action: "load", xml, autosave: 1 }), "*");
 			if (hasBackingFile) {
 				setTimeout(() => markEditorSaved(currentSavedTitle), 0);
 			}
@@ -693,7 +688,7 @@ function renderIndexHtml(inst) {
 		editorUi = this;
 		window.editorUi = this;
 		const result = old.apply(this, args);
-		if (!readOnly) installArtifactFileMenu(this);
+		installArtifactFileMenu(this);
 		if (hasBackingFile) {
 			setTimeout(() => markEditorSaved(currentSavedTitle), 0);
 		} else {
@@ -731,7 +726,7 @@ function renderIndexHtml(inst) {
 		const cmd = JSON.parse(e.data);
 		if (cmd.type === "load") {
 			syncFileState(cmd);
-			window.postMessage(JSON.stringify({ action: "load", xml: cmd.xml, autosave: readOnly ? 0 : 1 }), "*");
+			window.postMessage(JSON.stringify({ action: "load", xml: cmd.xml, autosave: 1 }), "*");
 			if (cmd.saved === false) {
 				lastDirty = true;
 			} else if (hasBackingFile) {
@@ -907,7 +902,6 @@ const canvas = createCanvas({
 			path: { type: "string", description: "Optional .drawio file path to read from and autosave back to." },
 			autosave: { type: "boolean", description: "When path is set, write editor autosaves and set_diagram changes back to the file. Defaults to true." },
 			title: { type: "string", description: "Optional diagram title." },
-			readOnly: { type: "boolean", description: "Open the diagram in read-only viewer mode. Defaults to false." },
 			theme: { enum: ["auto", "light", "dark"], description: "Editor theme. Defaults to auto, which follows the host app theme." },
 		},
 	},
@@ -1003,7 +997,6 @@ const canvas = createCanvas({
 		inst.extensionId = extensionId;
 		inst.canvasId = canvasId;
 		if (input && typeof input.theme === "string") inst.theme = input.theme;
-		if (input && typeof input.readOnly === "boolean") inst.readOnly = input.readOnly;
 		if (input && typeof input.artifactName === "string") {
 			const { artifactName, filePath } = resolveArtifactPath(input.artifactName);
 			inst.artifactName = artifactName;
