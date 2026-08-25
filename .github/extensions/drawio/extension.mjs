@@ -124,7 +124,9 @@ function resolveDiagramPath(filePath) {
 	if (typeof filePath !== "string" || filePath.length === 0) {
 		throw new CanvasError("invalid_path", "path must be a non-empty string.");
 	}
-	return path.resolve(filePath);
+	// Relative paths are interpreted against the session working directory, which is
+	// what the picker shows, rather than the extension process cwd.
+	return path.resolve(workingDirectory || process.cwd(), filePath);
 }
 
 async function writeDiagramFile(inst, xml) {
@@ -449,6 +451,7 @@ function renderIndexHtml(inst) {
 	}
 	#artifact-modal-error:empty,
 	#open-modal-error:empty { display: none; }
+	#open-modal-error.info { color: var(--text-color-muted, #59636e); }
 	#artifact-modal-actions,
 	#open-modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
 	#artifact-modal button,
@@ -696,9 +699,11 @@ function renderIndexHtml(inst) {
 				}),
 			];
 			if (data.truncated) {
+				error.className = "info";
 				error.textContent = "Showing the first matches only; type a path to open anything else.";
 			}
 		} catch (e) {
+			error.className = "";
 			error.textContent = "Could not list diagrams: " + String(e.message || e);
 		}
 
@@ -761,6 +766,7 @@ function renderIndexHtml(inst) {
 				const entry = visible[selectedIndex];
 				if (entry) return cleanup(entry.request);
 				if (!typed) {
+					error.className = "";
 					error.textContent = "Select a diagram or type a path.";
 					return;
 				}
@@ -770,6 +776,7 @@ function renderIndexHtml(inst) {
 			cancel.onclick = () => cleanup(null);
 			filter.oninput = () => {
 				selectedIndex = 0;
+				error.className = "";
 				error.textContent = "";
 				renderList();
 			};

@@ -24,7 +24,7 @@ The current extension uses the offline bundled draw.io webapp directly and injec
   - **Session artifacts** — `*.drawio` files in the session `files/` artifact directory.
   - **Repo** — `*.drawio` files under the session working directory (taken from the canvas open request's `session.workingDirectory`, falling back to the extension's cwd). The scan skips dot-directories, `node_modules`, `drawio-webapp`, and common build output directories, and is capped by depth and result count.
 
-  The filter box doubles as a free-text entry, so a path or artifact filename that was not discovered can still be opened. Opening binds the diagram with autosave enabled, so later edits write back to that file. If the current diagram has no backing file and is not empty, the picker confirms before discarding it.
+  The filter box doubles as a free-text entry, so a path or artifact filename that was not discovered can still be opened. A typed path may be absolute or relative to the session working directory shown in the list. Opening binds the diagram with autosave enabled, so later edits write back to that file. If the current diagram has no backing file and is not empty, the picker confirms before discarding it.
 - **File > Save artifact** writes the current diagram XML to the bound artifact. If the diagram is not bound yet, it asks for an artifact filename.
 - **File > Save as artifact...** always asks for an artifact filename and starts autosaving there.
 - Unsaved diagrams are titled `Untitled diagram (unsaved)` until they are bound to an artifact.
