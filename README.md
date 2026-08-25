@@ -32,5 +32,9 @@ Start a new Copilot session after installation, then ask Copilot to open the
 Ask Copilot to open the draw.io canvas and create or edit a diagram. Saved
 diagrams use the `.drawio` file format and can also be exported as SVG or PNG.
 
+Use **File > Open…** inside the canvas to switch to another diagram. The picker
+lists diagrams saved as session artifacts as well as any `.drawio` files in the
+repository.
+
 For extension internals, supported actions, and development instructions, see
 [the extension documentation](.github/extensions/drawio/README.md).

@@ -1,7 +1,7 @@
 import http from "node:http";
 import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CanvasError, createCanvas, joinSession } from "@github/copilot-sdk/extension";
@@ -9,6 +9,7 @@ import { CanvasError, createCanvas, joinSession } from "@github/copilot-sdk/exte
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WEBAPP_DIR = path.join(__dirname, "drawio-webapp");
 let artifactsDir;
+let workingDirectory = process.cwd();
 let session;
 
 const BLANK_XML = `<mxfile><diagram id="blank" name="Page-1"><mxGraphModel dx="800" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0"><root><mxCell id="0"/><mxCell id="1" parent="0"/></root></mxGraphModel></diagram></mxfile>`;
@@ -50,6 +51,7 @@ function getInstance(instanceId) {
 			filePath: null,
 			artifactName: null,
 			autosave: true,
+			theme: "auto",
 			extensionId: null,
 			canvasId: "drawio",
 			editorState: defaultEditorState(),
@@ -122,7 +124,9 @@ function resolveDiagramPath(filePath) {
 	if (typeof filePath !== "string" || filePath.length === 0) {
 		throw new CanvasError("invalid_path", "path must be a non-empty string.");
 	}
-	return path.resolve(filePath);
+	// Relative paths are interpreted against the session working directory, which is
+	// what the picker shows, rather than the extension process cwd.
+	return path.resolve(workingDirectory || process.cwd(), filePath);
 }
 
 async function writeDiagramFile(inst, xml) {
@@ -185,11 +189,111 @@ async function bindDiagramFile(inst, filePath, { moveExisting = false } = {}) {
 	return { path: inst.filePath, title: inst.title };
 }
 
+async function openExistingDiagram(inst, { artifactName, path: filePath }) {
+	let targetPath;
+	let targetArtifactName = null;
+	if (typeof artifactName === "string" && artifactName.trim()) {
+		({ artifactName: targetArtifactName, filePath: targetPath } = resolveArtifactPath(artifactName));
+	} else {
+		targetPath = resolveDiagramPath(filePath);
+		// A path that lands inside the artifacts directory is an artifact.
+		if (artifactsDir && path.dirname(targetPath) === artifactsDir) {
+			targetArtifactName = path.basename(targetPath);
+		}
+	}
+
+	if (!await fileExists(targetPath)) {
+		throw new CanvasError("not_found", `No diagram found at ${targetPath}`);
+	}
+	const xml = await readFile(targetPath, "utf8");
+	if (!xml.trim()) {
+		throw new CanvasError("invalid_diagram", `${path.basename(targetPath)} is empty.`);
+	}
+
+	inst.xml = xml;
+	inst.filePath = targetPath;
+	inst.artifactName = targetArtifactName;
+	inst.autosave = true;
+	inst.title = targetArtifactName || path.basename(targetPath);
+	inst.editorState = {
+		...inst.editorState,
+		diagram: { ...inst.editorState.diagram, title: inst.title, dirty: false },
+	};
+
+	pushToEditor(inst, {
+		type: "load",
+		xml,
+		title: inst.title,
+		filePath: inst.filePath,
+		artifactName: inst.artifactName,
+		autosave: inst.autosave,
+		saved: true,
+	});
+	queueCanvasChromeRefresh(inst);
+	return { artifactName: inst.artifactName, path: inst.filePath, title: inst.title };
+}
+
+const DIAGRAM_EXTENSION = ".drawio";
+const SCAN_MAX_DEPTH = 8;
+const SCAN_MAX_RESULTS = 500;
+const SCAN_SKIP_DIRECTORIES = new Set(["node_modules", "drawio-webapp", "dist", "build", "out", "target", "vendor"]);
+
+async function listArtifactDiagrams() {
+	if (!artifactsDir) return [];
+	let entries;
+	try {
+		entries = await readdir(artifactsDir, { withFileTypes: true });
+	} catch {
+		return [];
+	}
+	return entries
+		.filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(DIAGRAM_EXTENSION))
+		.map((entry) => ({ artifactName: entry.name, path: path.join(artifactsDir, entry.name) }))
+		.sort((a, b) => a.artifactName.localeCompare(b.artifactName));
+}
+
+async function listRepoDiagrams(root) {
+	if (!root) return [];
+	const found = [];
+	async function walk(dir, depth) {
+		if (depth > SCAN_MAX_DEPTH || found.length >= SCAN_MAX_RESULTS) return;
+		let entries;
+		try {
+			entries = await readdir(dir, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		const subdirectories = [];
+		for (const entry of entries) {
+			if (found.length >= SCAN_MAX_RESULTS) return;
+			if (entry.name.startsWith(".")) continue;
+			const full = path.join(dir, entry.name);
+			if (entry.isDirectory()) {
+				if (!SCAN_SKIP_DIRECTORIES.has(entry.name)) subdirectories.push(full);
+			} else if (entry.isFile() && entry.name.toLowerCase().endsWith(DIAGRAM_EXTENSION)) {
+				found.push({ relativePath: path.relative(root, full), path: full });
+			}
+		}
+		for (const subdirectory of subdirectories) {
+			await walk(subdirectory, depth + 1);
+		}
+	}
+	await walk(root, 0);
+	return found.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+}
+
+async function listDiagrams() {
+	const artifacts = await listArtifactDiagrams();
+	const seen = new Set(artifacts.map((entry) => entry.path));
+	const repo = (await listRepoDiagrams(workingDirectory)).filter((entry) => !seen.has(entry.path));
+	return { artifacts, repo, truncated: repo.length + artifacts.length >= SCAN_MAX_RESULTS };
+}
+
 function currentOpenInput(inst) {
-	const input = { title: inst.title, xml: inst.xml, autosave: inst.autosave };
+	const input = { title: inst.title, xml: inst.xml, autosave: inst.autosave, theme: inst.theme };
 	if (inst.artifactName) return { artifactName: inst.artifactName, ...input };
 	if (inst.filePath) return { path: inst.filePath, ...input };
-	return { title: inst.title };
+	return { title: inst.title, theme: inst.theme };
 }
 async function refreshCanvasChrome(inst) {
 	const request = {
@@ -208,7 +312,8 @@ function queueCanvasChromeRefresh(inst) {
 		});
 	}, 0);
 }
-function renderIndexHtml(instanceId) {
+function renderIndexHtml(inst) {
+	const instanceId = inst.instanceId;
 	return `<!doctype html>
 <html>
 <head>
@@ -222,47 +327,160 @@ function renderIndexHtml(instanceId) {
 <style>
 	body { overflow: hidden; padding: 0; }
 	div.picker { z-index: 10007; }
-	#artifact-modal-backdrop {
+	#artifact-modal-backdrop,
+	#open-modal-backdrop {
 		position: fixed;
 		inset: 0;
 		z-index: 1000000;
-		background: rgba(0, 0, 0, 0.55);
+		background: var(--background-color-overlay-backdrop, rgba(0, 0, 0, 0.5));
 		display: none;
 		align-items: center;
 		justify-content: center;
-	}
-	#artifact-modal {
-		width: min(420px, calc(100vw - 48px));
-		background: #252526;
-		color: #ddd;
-		border: 1px solid #555;
-		border-radius: 8px;
-		box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
-		font: 13px system-ui, sans-serif;
 		padding: 16px;
 	}
-	#artifact-modal h2 { margin: 0 0 10px; font-size: 15px; font-weight: 600; }
-	#artifact-modal p { margin: 0 0 10px; color: #aaa; }
-	#artifact-modal input {
+	#artifact-modal,
+	#open-modal {
+		display: flex;
+		flex-direction: column;
+		width: min(440px, 100%);
+		max-height: min(560px, 100%);
+		box-sizing: border-box;
+		background: var(--background-color-overlay, #ffffff);
+		color: var(--text-color-default, #1f2328);
+		border: 1px solid var(--border-color-overlay, var(--border-color-default, #d1d9e0));
+		border-radius: 12px;
+		box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15), 0 1px 3px rgba(0, 0, 0, 0.12);
+		font-family: var(--font-sans, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
+		font-size: var(--text-body-medium, 14px);
+		line-height: var(--leading-body-medium, 20px);
+		padding: 16px;
+		gap: 12px;
+	}
+	#artifact-modal h2,
+	#open-modal h2 {
+		margin: 0;
+		font-size: var(--text-title-small, 16px);
+		line-height: var(--leading-title-small, 24px);
+		font-weight: var(--font-weight-semibold, 600);
+	}
+	#artifact-modal p {
+		margin: -4px 0 0;
+		color: var(--text-color-muted, #59636e);
+		font-size: var(--text-body-small, 12px);
+		line-height: var(--leading-body-small, 18px);
+	}
+	#artifact-modal input,
+	#open-modal input {
 		width: 100%;
 		box-sizing: border-box;
-		background: #1e1e1e;
-		color: #ddd;
-		border: 1px solid #666;
-		border-radius: 4px;
-		padding: 7px 8px;
-	}
-	#artifact-modal-error { min-height: 18px; margin-top: 6px; color: #ff8080; }
-	#artifact-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
-	#artifact-modal button {
-		background: #333;
-		color: #ddd;
-		border: 1px solid #666;
-		border-radius: 4px;
+		background: var(--background-color-control-rest, transparent);
+		color: var(--text-color-control-rest, var(--text-color-default, #1f2328));
+		border: 1px solid var(--border-color-control-rest, var(--border-color-default, #d1d9e0));
+		border-radius: 6px;
 		padding: 5px 12px;
+		font-family: inherit;
+		font-size: inherit;
+		line-height: inherit;
+	}
+	#artifact-modal input::placeholder,
+	#open-modal input::placeholder {
+		color: var(--text-color-control-placeholder, var(--text-color-muted, #59636e));
+	}
+	#artifact-modal input:focus-visible,
+	#open-modal input:focus-visible,
+	#artifact-modal button:focus-visible,
+	#open-modal button:focus-visible {
+		outline: 2px solid var(--outline-color-focus-default, var(--color-focus-outline, #0969da));
+		outline-offset: -1px;
+	}
+	#open-modal-list {
+		flex: 1 1 auto;
+		min-height: 0;
+		overflow-y: auto;
+		margin: 0 -4px;
+		padding: 0 4px;
+	}
+	#open-modal-list .group {
+		padding: 8px 8px 4px;
+		color: var(--text-color-muted, #59636e);
+		font-size: var(--text-caption, 12px);
+		line-height: var(--leading-caption, 16px);
+		font-weight: var(--font-weight-semibold, 600);
+	}
+	#open-modal-list .group:first-child { padding-top: 0; }
+	#open-modal-list .entry {
+		display: flex;
+		align-items: baseline;
+		gap: 8px;
+		padding: 5px 8px;
+		border-radius: 6px;
+		cursor: pointer;
+		user-select: none;
+	}
+	#open-modal-list .entry:hover {
+		background: var(--background-color-control-transparent-hover, rgba(0, 0, 0, 0.05));
+	}
+	#open-modal-list .entry[aria-selected="true"] {
+		background: var(--background-color-control-transparent-selected, rgba(0, 0, 0, 0.08));
+	}
+	#open-modal-list .entry .name {
+		flex: 0 1 auto;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	#open-modal-list .entry .badge {
+		flex: 1 1 auto;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		color: var(--text-color-muted, #59636e);
+		font-size: var(--text-body-small, 12px);
+	}
+	#open-modal-list .empty {
+		padding: 12px 8px;
+		color: var(--text-color-muted, #59636e);
+		font-size: var(--text-body-small, 12px);
+	}
+	#artifact-modal-error,
+	#open-modal-error {
+		color: var(--text-color-danger, var(--true-color-red, #d1242f));
+		font-size: var(--text-body-small, 12px);
+		line-height: var(--leading-body-small, 18px);
+	}
+	#artifact-modal-error:empty,
+	#open-modal-error:empty { display: none; }
+	#open-modal-error.info { color: var(--text-color-muted, #59636e); }
+	#artifact-modal-actions,
+	#open-modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+	#artifact-modal button,
+	#open-modal button {
+		background: var(--background-color-button-default-rest, transparent);
+		color: var(--text-color-button-default-rest, var(--text-color-default, #1f2328));
+		border: 1px solid var(--border-color-button-default-rest, var(--border-color-default, #d1d9e0));
+		border-radius: 6px;
+		padding: 5px 12px;
+		font-family: inherit;
+		font-size: var(--text-body-medium, 14px);
+		line-height: var(--leading-body-medium, 20px);
+		font-weight: var(--font-weight-medium, 500);
 		cursor: pointer;
 	}
-	#artifact-modal button.primary { background: #0e639c; border-color: #1177bb; color: white; }
+	#artifact-modal button:hover,
+	#open-modal button:hover {
+		background: var(--background-color-button-default-hover, rgba(0, 0, 0, 0.05));
+	}
+	#artifact-modal button.primary,
+	#open-modal button.primary {
+		background: var(--background-color-button-primary-rest, #1f883d);
+		border-color: var(--border-color-button-primary-rest, transparent);
+		color: var(--text-color-button-primary-rest, #ffffff);
+	}
+	#artifact-modal button.primary:hover,
+	#open-modal button.primary:hover {
+		background: var(--background-color-button-primary-hover, #1a7f37);
+	}
 	.geSidebarContainer .geTitle input { font-size: 8pt; color: #606060; }
 	.geBlock { z-index: -3; margin: 100px; margin-top: 40px; margin-bottom: 30px; padding: 20px; text-align: center; min-width: 50%; }
 	.geBlock h1, .geBlock h2 { margin-top: 0; padding-top: 0; }
@@ -439,6 +657,164 @@ function renderIndexHtml(instanceId) {
 		});
 	}
 
+	async function pickDiagram() {
+		const backdrop = document.getElementById("open-modal-backdrop");
+		const filter = document.getElementById("open-modal-filter");
+		const list = document.getElementById("open-modal-list");
+		const error = document.getElementById("open-modal-error");
+		const ok = document.getElementById("open-modal-ok");
+		const cancel = document.getElementById("open-modal-cancel");
+
+		let entries = [];
+		let visible = [];
+		let selectedIndex = 0;
+		let submit = () => {};
+
+		error.textContent = "";
+		filter.value = "";
+		list.innerHTML = '<div class="empty">Loading\\u2026</div>';
+		backdrop.style.display = "flex";
+		filter.focus();
+
+		try {
+			const response = await fetch("/diagrams?instanceId=" + encodeURIComponent(instanceId));
+			const data = await response.json();
+			entries = [
+				...data.artifacts.map((entry) => ({
+					label: entry.artifactName,
+					name: entry.artifactName,
+					detail: "",
+					group: "Session artifacts",
+					request: { artifactName: entry.artifactName },
+				})),
+				...data.repo.map((entry) => {
+					const slash = entry.relativePath.lastIndexOf("/");
+					return {
+						label: entry.relativePath,
+						name: slash === -1 ? entry.relativePath : entry.relativePath.slice(slash + 1),
+						detail: slash === -1 ? "" : entry.relativePath.slice(0, slash),
+						group: "Repo",
+						request: { path: entry.path },
+					};
+				}),
+			];
+			if (data.truncated) {
+				error.className = "info";
+				error.textContent = "Showing the first matches only; type a path to open anything else.";
+			}
+		} catch (e) {
+			error.className = "";
+			error.textContent = "Could not list diagrams: " + String(e.message || e);
+		}
+
+		function renderList() {
+			const needle = filter.value.trim().toLowerCase();
+			visible = needle ? entries.filter((entry) => entry.label.toLowerCase().includes(needle)) : entries.slice();
+			selectedIndex = Math.min(selectedIndex, Math.max(visible.length - 1, 0));
+			if (visible.length === 0) {
+				const hint = filter.value.trim()
+					? "No match. Press Enter to open this path."
+					: "No .drawio diagrams found.";
+				list.innerHTML = '<div class="empty"></div>';
+				list.firstChild.textContent = hint;
+				return;
+			}
+			list.textContent = "";
+			let group = null;
+			visible.forEach((entry, index) => {
+				if (entry.group !== group) {
+					group = entry.group;
+					const header = document.createElement("div");
+					header.className = "group";
+					header.textContent = group;
+					list.appendChild(header);
+				}
+				const row = document.createElement("div");
+				row.className = "entry";
+				row.setAttribute("role", "option");
+				row.setAttribute("aria-selected", String(index === selectedIndex));
+				const name = document.createElement("span");
+				name.className = "name";
+				name.textContent = entry.name;
+				row.appendChild(name);
+				if (entry.detail) {
+					const detail = document.createElement("span");
+					detail.className = "badge";
+					detail.textContent = entry.detail;
+					row.appendChild(detail);
+				}
+				row.onclick = () => {
+					selectedIndex = index;
+					submit();
+				};
+				list.appendChild(row);
+				if (index === selectedIndex) row.scrollIntoView({ block: "nearest" });
+			});
+		}
+
+		return new Promise((resolve) => {
+			const cleanup = (value) => {
+				backdrop.style.display = "none";
+				ok.onclick = null;
+				cancel.onclick = null;
+				filter.oninput = null;
+				filter.onkeydown = null;
+				resolve(value);
+			};
+			submit = () => {
+				const typed = filter.value.trim();
+				const entry = visible[selectedIndex];
+				if (entry) return cleanup(entry.request);
+				if (!typed) {
+					error.className = "";
+					error.textContent = "Select a diagram or type a path.";
+					return;
+				}
+				cleanup(typed.includes("/") || typed.includes("\\\\") ? { path: typed } : { artifactName: typed });
+			};
+			ok.onclick = submit;
+			cancel.onclick = () => cleanup(null);
+			filter.oninput = () => {
+				selectedIndex = 0;
+				error.className = "";
+				error.textContent = "";
+				renderList();
+			};
+			filter.onkeydown = (event) => {
+				if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+					event.preventDefault();
+					if (visible.length === 0) return;
+					selectedIndex = (selectedIndex + (event.key === "ArrowDown" ? 1 : -1) + visible.length) % visible.length;
+					renderList();
+					return;
+				}
+				if (event.key === "Enter") submit();
+				if (event.key === "Escape") cleanup(null);
+			};
+			renderList();
+		});
+	}
+
+	function diagramHasContent() {
+		const model = editorUi?.editor?.graph?.getModel?.();
+		if (!model) return false;
+		return Object.keys(model.cells || {}).some((id) => id !== "0" && id !== "1");
+	}
+
+	async function openDiagram() {
+		if (!hasBackingFile && diagramHasContent()) {
+			const proceed = confirm("The current diagram is not saved. Opening another diagram discards it. Continue?");
+			if (!proceed) return;
+		}
+		const request = await pickDiagram();
+		if (!request) return;
+		const response = await sendBackend("/open", { instanceId, ...request });
+		const result = await response.json();
+		if (!result.ok) throw new Error(result.error || "Open failed");
+		syncFileState({ artifactName: result.artifactName, filePath: result.path, title: result.title, autosave: true });
+		markEditorSaved(result.title);
+	}
+
 	async function saveArtifact() {
 		const artifactName = currentArtifactName || await askArtifactName("Save artifact filename", "diagram.drawio");
 		if (!artifactName) return;
@@ -465,6 +841,9 @@ function renderIndexHtml(instanceId) {
 			if (typeof menu.addSeparator === "function") {
 				menu.addSeparator(parent);
 			}
+			menu.addItem("Open...", null, () => {
+				openDiagram().catch((e) => alert(String(e.message || e)));
+			}, parent);
 			menu.addItem("Save", null, () => {
 				saveArtifact().catch((e) => alert(String(e.message || e)));
 			}, parent);
@@ -523,13 +902,28 @@ function renderIndexHtml(instanceId) {
 	});
 
 	const appearance = 1;
-	const theme = "dark";
+	const themePreference = ${JSON.stringify(inst.theme || "auto")};
+
+	// The host mirrors its theme contract (data-color-mode / data-dark-theme)
+	// onto this document, so "auto" follows the app instead of a fixed value.
+	function hostPrefersDark() {
+		if (themePreference === "dark") return true;
+		if (themePreference === "light") return false;
+		const mode = document.documentElement.getAttribute("data-color-mode")
+			|| document.body?.getAttribute("data-color-mode");
+		if (mode === "dark") return true;
+		if (mode === "light") return false;
+		return window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? true;
+	}
+
+	let darkMode = hostPrefersDark();
+	const theme = darkMode ? "dark" : "kennedy";
 	const urlParams = {
 		embed: "1",
 		configure: "1",
 		proto: "json",
 		ui: theme,
-		dark: "1",
+		dark: darkMode ? "1" : "0",
 		lang: "en",
 		noSaveBtn: "1",
 		noExitBtn: "1",
@@ -588,6 +982,18 @@ function renderIndexHtml(instanceId) {
 		</div>
 	</div>
 </div>
+<div id="open-modal-backdrop">
+	<div id="open-modal" role="dialog" aria-modal="true" aria-labelledby="open-modal-title">
+		<h2 id="open-modal-title">Open diagram</h2>
+		<input id="open-modal-filter" autocomplete="off" spellcheck="false" placeholder="Filter, or type a path" aria-controls="open-modal-list" />
+		<div id="open-modal-list" role="listbox" aria-labelledby="open-modal-title"></div>
+		<div id="open-modal-error"></div>
+		<div id="open-modal-actions">
+			<button id="open-modal-cancel" type="button">Cancel</button>
+			<button id="open-modal-ok" class="primary" type="button">Open</button>
+		</div>
+	</div>
+</div>
 <div id="geInfo">
 	<div class="geBlock" style="text-align: center; min-width: 50%">
 		<h1>Flowchart Maker and Online Diagram Software</h1>
@@ -607,7 +1013,7 @@ function renderIndexHtml(instanceId) {
 		if (msg.event === "configure") {
 			window.postMessage(JSON.stringify({
 				action: "configure",
-				config: { compressXml: false, defaultLibraries: "general", libraries: "general", ui: "dark" },
+				config: { compressXml: false, defaultLibraries: "general", libraries: "general", ui: theme },
 			}), "*");
 		} else if (msg.event === "init") {
 			const r = await fetch("/state?instanceId=" + encodeURIComponent(instanceId));
@@ -670,6 +1076,21 @@ function renderIndexHtml(instanceId) {
 		return url != null && !/^(\\/\\/|[a-zA-Z][a-zA-Z\\d+\\-.]*:)/.test(url);
 	};
 	App.main();
+
+	function syncHostTheme() {
+		const dark = hostPrefersDark();
+		if (dark === darkMode) return;
+		darkMode = dark;
+		editorUi?.setDarkMode?.(dark);
+	}
+
+	if (themePreference === "auto") {
+		new MutationObserver(syncHostTheme).observe(document.documentElement, {
+			attributes: true,
+			attributeFilter: ["data-color-mode", "data-dark-theme", "data-light-theme"],
+		});
+		window.matchMedia?.("(prefers-color-scheme: dark)").addEventListener?.("change", syncHostTheme);
+	}
 
 	const sse = new EventSource("/events?instanceId=" + encodeURIComponent(instanceId));
 	sse.onmessage = async (e) => {
@@ -742,7 +1163,7 @@ async function ensureServer() {
 					return;
 				}
 				res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-				res.end(renderIndexHtml(instanceId));
+				res.end(renderIndexHtml(getInstance(instanceId)));
 				return;
 			}
 
@@ -785,6 +1206,34 @@ async function ensureServer() {
 				queueCanvasChromeRefresh(inst);
 				res.writeHead(200, { "content-type": "application/json" });
 				res.end(JSON.stringify({ ok: true, ...result }));
+				return;
+			}
+
+			if (req.method === "GET" && url.pathname === "/diagrams") {
+				const inst = getInstance(instanceId);
+				const { artifacts, repo, truncated } = await listDiagrams();
+				res.writeHead(200, { "content-type": "application/json" });
+				res.end(JSON.stringify({
+					artifacts,
+					repo,
+					truncated,
+					workingDirectory,
+					current: { artifactName: inst.artifactName, path: inst.filePath },
+				}));
+				return;
+			}
+
+			if (req.method === "POST" && url.pathname === "/open") {
+				const body = await readJsonBody(req);
+				const inst = getInstance(body.instanceId);
+				try {
+					const result = await openExistingDiagram(inst, body);
+					res.writeHead(200, { "content-type": "application/json" });
+					res.end(JSON.stringify({ ok: true, ...result }));
+				} catch (error) {
+					res.writeHead(400, { "content-type": "application/json" });
+					res.end(JSON.stringify({ ok: false, error: String(error?.message || error) }));
+				}
 				return;
 			}
 
@@ -852,8 +1301,7 @@ const canvas = createCanvas({
 			path: { type: "string", description: "Optional .drawio file path to read from and autosave back to." },
 			autosave: { type: "boolean", description: "When path is set, write editor autosaves and set_diagram changes back to the file. Defaults to true." },
 			title: { type: "string", description: "Optional diagram title." },
-			readOnly: { type: "boolean", description: "Whether to open the diagram in read-only mode." },
-			theme: { enum: ["auto", "light", "dark"], description: "Initial editor theme preference." },
+			theme: { enum: ["auto", "light", "dark"], description: "Editor theme. Defaults to auto, which follows the host app theme." },
 		},
 	},
 	actions: [
@@ -942,11 +1390,15 @@ const canvas = createCanvas({
 			},
 		},
 	],
-	async open({ extensionId, canvasId, instanceId, input }) {
+	async open({ extensionId, canvasId, instanceId, input, session: sessionContext }) {
+		if (typeof sessionContext?.workingDirectory === "string" && sessionContext.workingDirectory) {
+			workingDirectory = sessionContext.workingDirectory;
+		}
 		const url = await ensureServer();
 		const inst = getInstance(instanceId);
 		inst.extensionId = extensionId;
 		inst.canvasId = canvasId;
+		if (input && typeof input.theme === "string") inst.theme = input.theme;
 		if (input && typeof input.artifactName === "string") {
 			const { artifactName, filePath } = resolveArtifactPath(input.artifactName);
 			inst.artifactName = artifactName;
